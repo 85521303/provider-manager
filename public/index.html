@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Provider Manager</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">CP</div>
+          <div>
+            <h1>Provider Manager</h1>
+            <p id="codexHome">Loading...</p>
+          </div>
+        </div>
+
+        <button class="provider-item active" data-provider="__all__">
+          <span>全部对话</span>
+          <strong id="allCount">0</strong>
+        </button>
+        <div id="providerList" class="provider-list"></div>
+      </aside>
+
+      <main class="main">
+        <section class="toolbar">
+          <div class="toolbar-row">
+            <div class="search-box">
+              <span class="search-icon">⌕</span>
+              <input id="searchInput" type="search" placeholder="搜索标题、工作目录、模型或 ID" />
+            </div>
+            <button id="reloadBtn" class="ghost-btn" title="重新读取 Codex 本地记录">刷新</button>
+            <button id="syncAllBtn" class="primary-btn" title="把每组对话补齐到所有 provider">同步全部</button>
+          </div>
+
+          <div class="toolbar-row actions-row">
+            <span id="selectedCount" class="selection-count">未选择</span>
+            <select id="targetProvider"></select>
+            <button id="moveBtn" class="ghost-btn">移动</button>
+            <button id="syncBtn" class="ghost-btn">同步</button>
+            <button id="deleteBtn" class="danger-btn">删除</button>
+          </div>
+
+          <div class="toolbar-row filter-row">
+            <select id="modelFilter" title="按模型名称筛选"></select>
+            <input id="startDateFilter" type="date" title="更新时间起始日期" />
+            <input id="endDateFilter" type="date" title="更新时间结束日期" />
+            <select id="statusFilter" title="按状态筛选">
+              <option value="__all__">全部状态</option>
+              <option value="normal">正常</option>
+              <option value="archived">已归档</option>
+              <option value="synced">同步副本</option>
+              <option value="missing">文件缺失</option>
+              <option value="mismatch">Provider 不一致</option>
+            </select>
+            <button id="clearFiltersBtn" class="ghost-btn">清除筛选</button>
+          </div>
+        </section>
+
+        <section class="summary-grid" id="summaryGrid"></section>
+
+        <section class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th class="check-cell"><input id="selectAll" type="checkbox" /></th>
+                <th>对话</th>
+                <th>Provider</th>
+                <th>模型</th>
+                <th>更新时间</th>
+                <th>状态</th>
+                <th class="row-actions-head"></th>
+              </tr>
+            </thead>
+            <tbody id="threadRows"></tbody>
+          </table>
+          <div id="emptyState" class="empty-state" hidden>没有匹配的对话</div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="providerDialog">
+      <form method="dialog" class="dialog-card">
+        <h2 id="providerDialogTitle">删除 Provider</h2>
+        <p id="providerDialogText"></p>
+        <label class="check-line">
+          <input id="deleteProviderThreads" type="checkbox" />
+          同时删除该 provider 下的全部对话
+        </label>
+        <div class="dialog-actions">
+          <button value="cancel" class="ghost-btn">取消</button>
+          <button id="confirmDeleteProvider" value="confirm" class="danger-btn">删除</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="providerConfigDialog">
+      <form id="providerConfigForm" class="dialog-card">
+        <h2 id="providerConfigTitle">配置 Provider</h2>
+        <p id="providerConfigText" hidden></p>
+        <input id="providerConfigOriginal" type="hidden" />
+        <div class="field-stack">
+          <label>
+            <span>Provider 名</span>
+            <input id="providerConfigKey" type="text" autocomplete="off" required />
+          </label>
+          <label>
+            <span>name</span>
+            <input id="providerConfigName" type="text" autocomplete="off" required />
+          </label>
+          <label>
+            <span>base_url</span>
+            <input id="providerConfigBaseUrl" type="url" autocomplete="off" required />
+          </label>
+          <label>
+            <span>env_key</span>
+            <input id="providerConfigEnvKey" type="text" autocomplete="off" required />
+          </label>
+        </div>
+        <div class="dialog-actions">
+          <button id="cancelProviderConfig" type="button" class="ghost-btn">取消</button>
+          <button id="confirmSaveProvider" type="submit" class="primary-btn">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="threadDialog">
+      <div class="thread-dialog-card">
+        <header class="thread-dialog-header">
+          <div>
+            <h2 id="threadDialogTitle">对话记录</h2>
+            <p id="threadDialogMeta"></p>
+          </div>
+          <button id="closeThreadDialog" class="ghost-btn" aria-label="关闭对话记录">关闭</button>
+        </header>
+        <div id="threadMessages" class="thread-messages"></div>
+      </div>
+    </dialog>
+
+    <div id="toast" class="toast" hidden></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
