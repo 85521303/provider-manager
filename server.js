@@ -3,6 +3,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
+const readline = require("readline");
 const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 const sea = require("node:sea");
@@ -13,9 +14,14 @@ const DEFAULT_PORT = Number(process.env.PORT || 3767);
 const APP_VERSION = 1;
 const MAX_FIRST_LINE_BYTES = 10 * 1024 * 1024;
 const MAX_CONVERSATION_MESSAGE_CHARS = 40000;
+const MAX_CLAUDE_MESSAGE_CHARS = 40000;
+const MAX_CLAUDE_TITLE_CHARS = 120;
 let embeddedSqlitePath = null;
 let lastHeartbeatAt = 0;
 let sawHeartbeat = false;
+let authWatcherTimer = null;
+let authWatcherLastMtimeMs = 0;
+let authWatcherLastSize = 0;
 
 function isSeaExecutable() {
   return typeof sea.isSea === "function" && sea.isSea();
@@ -35,13 +41,22 @@ function embeddedSqliteExecutable() {
   if (embeddedSqlitePath) return embeddedSqlitePath;
 
   try {
-    const runtimeDir = path.join(os.tmpdir(), "codex-provider-manager-runtime");
-    const sqliteExe = path.join(runtimeDir, "sqlite3.exe");
-    writeEmbeddedAsset("vendor/sqlite3.exe", sqliteExe);
-    try {
-      writeEmbeddedAsset("vendor/sqlite3.dll", path.join(runtimeDir, "sqlite3.dll"));
-    } catch {
-      // Some sqlite3.exe builds are fully static and do not need a DLL.
+    const runtimeDir = path.join(os.tmpdir(), "provider-manager-runtime");
+    const sqliteName = process.platform === "win32" ? "sqlite3.exe" : "sqlite3";
+    const sqliteExe = path.join(runtimeDir, sqliteName);
+    writeEmbeddedAsset(`vendor/${sqliteName}`, sqliteExe);
+    if (process.platform !== "win32") {
+      try {
+        fs.chmodSync(sqliteExe, 0o755);
+      } catch {
+        // The extracted binary may already have executable permissions.
+      }
+    } else {
+      try {
+        writeEmbeddedAsset("vendor/sqlite3.dll", path.join(runtimeDir, "sqlite3.dll"));
+      } catch {
+        // Some sqlite3.exe builds are fully static and do not need a DLL.
+      }
     }
     embeddedSqlitePath = sqliteExe;
     return embeddedSqlitePath;
@@ -72,6 +87,10 @@ function globalStatePath() {
 
 function configPath() {
   return path.join(getCodexHome(), "config.toml");
+}
+
+function authPath() {
+  return path.join(getCodexHome(), "auth.json");
 }
 
 function sessionIndexPath() {
@@ -165,6 +184,11 @@ function trimMessageText(text) {
   return `${text.slice(0, MAX_CONVERSATION_MESSAGE_CHARS)}\n\n[内容过长，已在预览中截断]`;
 }
 
+function trimClaudeMessageText(text) {
+  if (!text || text.length <= MAX_CLAUDE_MESSAGE_CHARS) return text || "";
+  return `${text.slice(0, MAX_CLAUDE_MESSAGE_CHARS)}\n\n[内容过长，已在预览中截断]`;
+}
+
 function extractChatMessage(entry, lineNumber) {
   const payload = entry && entry.payload ? entry.payload : {};
   if (entry.type !== "response_item" || payload.type !== "message") return null;
@@ -226,7 +250,7 @@ async function readConversation(threadId) {
 function updateSessionMeta(filePath, updater) {
   const content = fs.readFileSync(filePath, "utf8");
   const newlineIndex = content.indexOf("\n");
-  const firstLine = newlineIndex >= 0 ? content.slice(0, newlineIndex).replace(/\r$/, "") : content;
+  const firstLine = (newlineIndex >= 0 ? content.slice(0, newlineIndex).replace(/\r$/, "") : content).replace(/^\uFEFF/, "");
   const rest = newlineIndex >= 0 ? content.slice(newlineIndex + 1) : "";
   const parsed = JSON.parse(firstLine);
 
@@ -241,21 +265,208 @@ function updateSessionMeta(filePath, updater) {
 
 function readManagerState() {
   const file = managerStatePath();
-  if (!fs.existsSync(file)) return { version: APP_VERSION, threads: {} };
+  if (!fs.existsSync(file)) {
+    return { version: APP_VERSION, threads: {}, authByProvider: {}, currentAuthProvider: "" };
+  }
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
     return {
       version: parsed.version || APP_VERSION,
       threads: parsed.threads && typeof parsed.threads === "object" ? parsed.threads : {},
+      authByProvider: parsed.authByProvider && typeof parsed.authByProvider === "object" ? parsed.authByProvider : {},
+      currentAuthProvider: typeof parsed.currentAuthProvider === "string" ? parsed.currentAuthProvider : "",
     };
   } catch {
-    return { version: APP_VERSION, threads: {} };
+    return { version: APP_VERSION, threads: {}, authByProvider: {}, currentAuthProvider: "" };
   }
 }
 
 function writeManagerState(state) {
   const file = managerStatePath();
-  fs.writeFileSync(file, `${JSON.stringify({ version: APP_VERSION, threads: state.threads || {} }, null, 2)}\n`, "utf8");
+  fs.writeFileSync(file, `${JSON.stringify({
+    version: APP_VERSION,
+    threads: state.threads || {},
+    authByProvider: state.authByProvider || {},
+    currentAuthProvider: state.currentAuthProvider || "",
+  }, null, 2)}\n`, "utf8");
+}
+
+function isOpenAiAuthProvider(providerName) {
+  const name = String(providerName || "").trim().toLowerCase();
+  return name === "openai";
+}
+
+function readAuthJson(options = {}) {
+  const file = authPath();
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    if (options.logError) {
+      console.warn(`Could not parse auth.json: ${error.message || error}`);
+    }
+    return null;
+  }
+}
+
+function authFileStats() {
+  const file = authPath();
+  if (!fs.existsSync(file)) return null;
+  const stats = fs.statSync(file);
+  return {
+    mtimeMs: Number(stats.mtimeMs || 0),
+    size: Number(stats.size || 0),
+  };
+}
+
+function setAuthWatcherBaselineFromFile() {
+  const stats = authFileStats();
+  if (!stats) {
+    authWatcherLastMtimeMs = 0;
+    authWatcherLastSize = 0;
+    return;
+  }
+  authWatcherLastMtimeMs = stats.mtimeMs;
+  authWatcherLastSize = stats.size;
+}
+
+function saveCurrentAuthForProvider(managerState, providerName) {
+  if (!isOpenAiAuthProvider(providerName)) return { changed: false, action: "not-openai" };
+  const auth = readAuthJson();
+  if (!auth) return { changed: false, action: "invalid-or-missing-auth" };
+  const stats = authFileStats();
+  const previous = managerState.authByProvider && managerState.authByProvider[providerName];
+  const next = {
+    auth,
+    updatedAt: new Date().toISOString(),
+    sourceMtimeMs: stats ? stats.mtimeMs : 0,
+  };
+  if (!managerState.authByProvider) managerState.authByProvider = {};
+  managerState.authByProvider[providerName] = next;
+  return {
+    changed: JSON.stringify(previous ? previous.auth : null) !== JSON.stringify(auth),
+    action: "saved-current-auth",
+  };
+}
+
+function restoreAuthForProvider(managerState, providerName) {
+  if (!isOpenAiAuthProvider(providerName)) {
+    managerState.currentAuthProvider = "";
+    return { changed: false, action: "not-openai" };
+  }
+
+  managerState.currentAuthProvider = providerName;
+  const entry = managerState.authByProvider && managerState.authByProvider[providerName];
+  const file = authPath();
+  if (entry && entry.auth && typeof entry.auth === "object") {
+    const original = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    const next = `${JSON.stringify(entry.auth, null, 2)}\n`;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, next, "utf8");
+    setAuthWatcherBaselineFromFile();
+    return {
+      changed: original !== next,
+      action: "restored-auth",
+    };
+  }
+
+  const existed = fs.existsSync(file);
+  if (existed) fs.unlinkSync(file);
+  setAuthWatcherBaselineFromFile();
+  return {
+    changed: existed,
+    action: "cleared-auth-awaiting-login",
+  };
+}
+
+function syncAuthForProviderSwitch(fromProvider, toProvider) {
+  const managerState = readManagerState();
+  const saved = saveCurrentAuthForProvider(managerState, fromProvider);
+  const restored = restoreAuthForProvider(managerState, toProvider);
+  writeManagerState(managerState);
+  return {
+    authChanged: Boolean(saved.changed || restored.changed),
+    authAction: restored.action,
+    authSaved: saved.action === "saved-current-auth",
+  };
+}
+
+function cleanupAuthForProvider(providerName) {
+  if (!isOpenAiAuthProvider(providerName)) return { changed: false, action: "not-openai" };
+  const managerState = readManagerState();
+  let changed = false;
+  if (managerState.authByProvider && Object.prototype.hasOwnProperty.call(managerState.authByProvider, providerName)) {
+    delete managerState.authByProvider[providerName];
+    changed = true;
+  }
+  if (managerState.currentAuthProvider === providerName) {
+    managerState.currentAuthProvider = "";
+    changed = true;
+  }
+  if (changed) writeManagerState(managerState);
+  return { changed, action: changed ? "deleted-auth" : "no-auth" };
+}
+
+function renameAuthForProvider(oldProvider, nextProvider) {
+  if (!oldProvider || oldProvider === nextProvider) return { changed: false, action: "unchanged" };
+
+  const oldIsOpenAi = isOpenAiAuthProvider(oldProvider);
+  const nextIsOpenAi = isOpenAiAuthProvider(nextProvider);
+  if (!oldIsOpenAi && !nextIsOpenAi) return { changed: false, action: "unchanged" };
+
+  const managerState = readManagerState();
+  if (!managerState.authByProvider) managerState.authByProvider = {};
+  let changed = false;
+  let action = "unchanged";
+
+  if (oldIsOpenAi && nextIsOpenAi && Object.prototype.hasOwnProperty.call(managerState.authByProvider, oldProvider)) {
+    managerState.authByProvider[nextProvider] = managerState.authByProvider[oldProvider];
+    delete managerState.authByProvider[oldProvider];
+    changed = true;
+    action = "renamed-auth";
+  } else if (oldIsOpenAi && !nextIsOpenAi && Object.prototype.hasOwnProperty.call(managerState.authByProvider, oldProvider)) {
+    delete managerState.authByProvider[oldProvider];
+    changed = true;
+    action = "deleted-auth";
+  }
+
+  if (managerState.currentAuthProvider === oldProvider) {
+    managerState.currentAuthProvider = nextIsOpenAi ? nextProvider : "";
+    changed = true;
+    action = action === "unchanged" ? "renamed-current-auth-provider" : action;
+  }
+
+  if (changed) writeManagerState(managerState);
+  return { changed, action };
+}
+
+function persistObservedAuthIfNeeded() {
+  const managerState = readManagerState();
+  const providerName = managerState.currentAuthProvider || "";
+  if (!isOpenAiAuthProvider(providerName)) return false;
+  const stats = authFileStats();
+  if (!stats) return false;
+  if (stats.mtimeMs === authWatcherLastMtimeMs && stats.size === authWatcherLastSize) return false;
+
+  const auth = readAuthJson({ logError: true });
+  if (!auth) {
+    authWatcherLastMtimeMs = stats.mtimeMs;
+    authWatcherLastSize = stats.size;
+    return false;
+  }
+  if (!managerState.authByProvider) managerState.authByProvider = {};
+  const previous = managerState.authByProvider[providerName];
+  const next = {
+    auth,
+    updatedAt: new Date().toISOString(),
+    sourceMtimeMs: stats.mtimeMs,
+  };
+  const changed = JSON.stringify(previous ? previous.auth : null) !== JSON.stringify(auth);
+  managerState.authByProvider[providerName] = next;
+  writeManagerState(managerState);
+  authWatcherLastMtimeMs = stats.mtimeMs;
+  authWatcherLastSize = stats.size;
+  return changed;
 }
 
 function readGlobalState() {
@@ -307,6 +518,15 @@ function copyObjectEntry(container, sourceId, targetId) {
   return true;
 }
 
+function replaceObjectEntry(container, sourceId, targetId) {
+  if (!container || typeof container !== "object") return false;
+  if (!Object.prototype.hasOwnProperty.call(container, sourceId)) return false;
+  const next = cloneJson(container[sourceId]);
+  const previous = container[targetId];
+  container[targetId] = next;
+  return JSON.stringify(previous) !== JSON.stringify(next);
+}
+
 function deleteObjectEntries(container, ids) {
   if (!container || typeof container !== "object") return false;
   let changed = false;
@@ -329,6 +549,28 @@ function cloneThreadGlobalState(globalState, sourceId, targetId) {
     changed = copyObjectEntry(container["prompt-history"], sourceId, targetId) || changed;
     changed = copyObjectEntry(container["heartbeat-thread-permissions-by-id"], sourceId, targetId) || changed;
     changed = copyObjectEntry(container["thread-workspace-root-hints"], sourceId, targetId) || changed;
+
+    if (Array.isArray(container["projectless-thread-ids"]) && container["projectless-thread-ids"].includes(sourceId)) {
+      changed = addUnique(container["projectless-thread-ids"], targetId) || changed;
+    }
+    if (Array.isArray(container["pinned-thread-ids"]) && container["pinned-thread-ids"].includes(sourceId)) {
+      changed = addUnique(container["pinned-thread-ids"], targetId) || changed;
+    }
+  }
+
+  return changed;
+}
+
+function replaceThreadGlobalState(globalState, sourceId, targetId) {
+  const atom = persistedAtomState(globalState);
+  if (!globalState || !sourceId || !targetId) return false;
+  let changed = false;
+  const containers = atom ? [globalState, atom] : [globalState];
+
+  for (const container of containers) {
+    changed = replaceObjectEntry(container["prompt-history"], sourceId, targetId) || changed;
+    changed = replaceObjectEntry(container["heartbeat-thread-permissions-by-id"], sourceId, targetId) || changed;
+    changed = replaceObjectEntry(container["thread-workspace-root-hints"], sourceId, targetId) || changed;
 
     if (Array.isArray(container["projectless-thread-ids"]) && container["projectless-thread-ids"].includes(sourceId)) {
       changed = addUnique(container["projectless-thread-ids"], targetId) || changed;
@@ -462,6 +704,9 @@ function normalizeProviderConfig(raw) {
 
   if (!providerName) throw new Error("Provider name is required.");
   if (!displayName) throw new Error("Provider display name is required.");
+  if (isOpenAiAuthProvider(providerName)) {
+    throw new Error('The built-in "openai" provider cannot be configured. Only one provider named "openai" is allowed.');
+  }
   if (!baseUrl) throw new Error("Provider base_url is required.");
   if (!envKey) throw new Error("Provider env_key is required.");
 
@@ -475,12 +720,60 @@ function normalizeProviderConfig(raw) {
 }
 
 function providerConfigSectionLines(provider) {
-  return [
+  const lines = [
     providerSectionHeader(provider.name),
     `name = ${tomlString(provider.displayName)}`,
-    `base_url = ${tomlString(provider.baseUrl)}`,
-    `env_key = ${tomlString(provider.envKey)}`,
   ];
+  if (provider.baseUrl) lines.push(`base_url = ${tomlString(provider.baseUrl)}`);
+  if (provider.envKey) lines.push(`env_key = ${tomlString(provider.envKey)}`);
+  return lines;
+}
+
+function updateActiveProviderOnly(providerName) {
+  const file = configPath();
+  const original = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+  const newline = original.includes("\r\n") ? "\r\n" : os.EOL;
+  const lines = original ? original.split(/\r?\n/) : [];
+  const output = [];
+  let inRoot = true;
+  let activeUpdated = false;
+
+  const insertActive = () => {
+    if (activeUpdated) return;
+    if (output.length && output[output.length - 1].trim() !== "") output.push("");
+    output.push(`model_provider = ${tomlString(providerName)}`);
+    activeUpdated = true;
+  };
+
+  for (const line of lines) {
+    const section = line.match(/^\s*\[([^\]]+)\]\s*$/);
+    if (section && inRoot) {
+      insertActive();
+      if (output.length && output[output.length - 1].trim() !== "") output.push("");
+      inRoot = false;
+      output.push(line);
+      continue;
+    }
+
+    const activeLine = line.match(/^(\s*model_provider\s*=\s*)(.+?)(\s*(?:#.*)?)$/);
+    if (inRoot && activeLine) {
+      output.push(`${activeLine[1]}${tomlString(providerName)}${activeLine[3] || ""}`);
+      activeUpdated = true;
+      continue;
+    }
+
+    output.push(line);
+  }
+
+  if (!activeUpdated) insertActive();
+
+  let next = output.join(newline);
+  if (next && !next.endsWith(newline)) next += newline;
+  if (next === original) return false;
+
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, next, "utf8");
+  return true;
 }
 
 function updateProviderInConfig(provider, options = {}) {
@@ -633,8 +926,13 @@ function syncKeyForThread(row, managerState) {
   return entry && entry.syncKey ? entry.syncKey : row.id;
 }
 
+function threadUpdatedAtMs(row) {
+  return Number(row && (row.updated_at_ms || row.updated_at * 1000) || 0);
+}
+
 function buildProviders(threads, config) {
   const providers = new Map();
+  const managerState = readManagerState();
 
   for (const provider of config.providers.values()) {
     providers.set(provider.name, {
@@ -642,6 +940,10 @@ function buildProviders(threads, config) {
       displayName: provider.displayName || provider.name,
       baseUrl: provider.baseUrl || "",
       envKey: provider.envKey || "",
+      hasAuth: Boolean(managerState.authByProvider && managerState.authByProvider[provider.name]),
+      authUpdatedAt: managerState.authByProvider && managerState.authByProvider[provider.name]
+        ? managerState.authByProvider[provider.name].updatedAt || ""
+        : "",
       configured: true,
       active: provider.name === config.activeProvider,
       threadCount: 0,
@@ -658,6 +960,10 @@ function buildProviders(threads, config) {
         displayName: name,
         baseUrl: "",
         envKey: "",
+        hasAuth: Boolean(managerState.authByProvider && managerState.authByProvider[name]),
+        authUpdatedAt: managerState.authByProvider && managerState.authByProvider[name]
+          ? managerState.authByProvider[name].updatedAt || ""
+          : "",
         configured: false,
         active: name === config.activeProvider,
         threadCount: 0,
@@ -671,6 +977,24 @@ function buildProviders(threads, config) {
     if (Number(thread.archived)) provider.archivedCount += 1;
     const updated = Number(thread.updated_at_ms || thread.updated_at * 1000 || 0);
     provider.latestUpdatedAtMs = Math.max(provider.latestUpdatedAtMs || 0, updated || 0);
+  }
+
+  if (config.activeProvider && !providers.has(config.activeProvider)) {
+    providers.set(config.activeProvider, {
+      name: config.activeProvider,
+      displayName: config.activeProvider,
+      baseUrl: "",
+      envKey: "",
+      hasAuth: Boolean(managerState.authByProvider && managerState.authByProvider[config.activeProvider]),
+      authUpdatedAt: managerState.authByProvider && managerState.authByProvider[config.activeProvider]
+        ? managerState.authByProvider[config.activeProvider].updatedAt || ""
+        : "",
+      configured: false,
+      active: true,
+      threadCount: 0,
+      archivedCount: 0,
+      latestUpdatedAtMs: null,
+    });
   }
 
   return Array.from(providers.values()).sort((a, b) => {
@@ -771,6 +1095,7 @@ async function createBackup(label, options = {}) {
 
   const files = new Set(options.files || []);
   if (options.includeConfig) files.add(configPath());
+  if (options.includeAuth) files.add(authPath());
   if (options.includeSessionIndex) files.add(sessionIndexPath());
   if (options.includeManagerState) files.add(managerStatePath());
   if (options.includeGlobalState) files.add(globalStatePath());
@@ -820,6 +1145,49 @@ function appendSessionIndex(row) {
     updated_at: new Date(updatedAtMs).toISOString(),
   };
   fs.appendFileSync(file, `${JSON.stringify(entry)}\n`, "utf8");
+}
+
+function rewriteSessionIndexUpserting(rows) {
+  const file = sessionIndexPath();
+  const byId = new Map((rows || []).filter(Boolean).map((row) => [row.id, row]));
+  if (!byId.size) return;
+
+  const nextLines = [];
+  const seen = new Set();
+  if (fs.existsSync(file)) {
+    for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const parsed = JSON.parse(line);
+        if (byId.has(parsed.id)) {
+          const row = byId.get(parsed.id);
+          const updatedAtMs = Number(row.updated_at_ms || row.updated_at * 1000 || Date.now());
+          nextLines.push(JSON.stringify({
+            id: row.id,
+            thread_name: row.title || row.first_user_message || "(untitled)",
+            updated_at: new Date(updatedAtMs).toISOString(),
+          }));
+          seen.add(row.id);
+          continue;
+        }
+      } catch {
+        // Keep malformed historical lines rather than deleting user data.
+      }
+      nextLines.push(line);
+    }
+  }
+
+  for (const row of byId.values()) {
+    if (seen.has(row.id)) continue;
+    const updatedAtMs = Number(row.updated_at_ms || row.updated_at * 1000 || Date.now());
+    nextLines.push(JSON.stringify({
+      id: row.id,
+      thread_name: row.title || row.first_user_message || "(untitled)",
+      updated_at: new Date(updatedAtMs).toISOString(),
+    }));
+  }
+
+  fs.writeFileSync(file, nextLines.length ? `${nextLines.join("\n")}\n` : "", "utf8");
 }
 
 function moveRolloutToTrash(filePath) {
@@ -996,6 +1364,78 @@ async function insertDuplicateThread(sourceRow, targetProvider, managerState, gl
   }
 }
 
+async function replaceExistingSyncedThread(sourceRow, targetRow, targetProvider, managerState, globalState) {
+  if (!sourceRow.rollout_path || !fs.existsSync(sourceRow.rollout_path)) {
+    throw new Error(`Rollout file is missing for ${sourceRow.id}`);
+  }
+  if (!targetRow.rollout_path) {
+    throw new Error(`Rollout path is missing for ${targetRow.id}`);
+  }
+
+  const syncKey = syncKeyForThread(sourceRow, managerState);
+  const targetId = targetRow.id;
+  const sourceId = sourceRow.id;
+  fs.mkdirSync(path.dirname(targetRow.rollout_path), { recursive: true });
+  fs.copyFileSync(sourceRow.rollout_path, targetRow.rollout_path);
+  updateSessionMeta(targetRow.rollout_path, (meta) => {
+    meta.payload.id = targetId;
+    meta.payload.model_provider = targetProvider;
+  });
+
+  const columns = await tableColumns("threads");
+  const nextRow = {
+    ...sourceRow,
+    id: targetId,
+    rollout_path: targetRow.rollout_path,
+    model_provider: targetProvider,
+  };
+  const assignments = columns
+    .filter((column) => column !== "id")
+    .map((column) => `${column} = ${sqlQuote(nextRow[column])}`)
+    .join(", ");
+
+  await runSql(`
+    PRAGMA busy_timeout = 5000;
+    BEGIN IMMEDIATE;
+    UPDATE threads
+       SET ${assignments}
+     WHERE id = ${sqlQuote(targetId)};
+
+    DELETE FROM thread_dynamic_tools WHERE thread_id = ${sqlQuote(targetId)};
+    INSERT OR IGNORE INTO thread_dynamic_tools (thread_id, position, name, description, input_schema, defer_loading, namespace)
+    SELECT ${sqlQuote(targetId)}, position, name, description, input_schema, defer_loading, namespace
+      FROM thread_dynamic_tools
+     WHERE thread_id = ${sqlQuote(sourceId)};
+
+    DELETE FROM stage1_outputs WHERE thread_id = ${sqlQuote(targetId)};
+    INSERT OR IGNORE INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, generated_at, rollout_slug, usage_count, last_usage, selected_for_phase2, selected_for_phase2_source_updated_at)
+    SELECT ${sqlQuote(targetId)}, source_updated_at, raw_memory, rollout_summary, generated_at, rollout_slug, usage_count, last_usage, selected_for_phase2, selected_for_phase2_source_updated_at
+      FROM stage1_outputs
+     WHERE thread_id = ${sqlQuote(sourceId)};
+
+    DELETE FROM thread_goals WHERE thread_id = ${sqlQuote(targetId)};
+    INSERT OR IGNORE INTO thread_goals (thread_id, goal_id, objective, status, token_budget, tokens_used, time_used_seconds, created_at_ms, updated_at_ms)
+    SELECT ${sqlQuote(targetId)}, goal_id, objective, status, token_budget, tokens_used, time_used_seconds, created_at_ms, updated_at_ms
+      FROM thread_goals
+     WHERE thread_id = ${sqlQuote(sourceId)};
+    COMMIT;
+  `);
+
+  managerState.threads[targetId] = {
+    ...(managerState.threads[targetId] || {}),
+    syncKey,
+    createdByTool: true,
+    sourceThreadId: sourceId,
+    sourceProvider: sourceRow.model_provider || "",
+    targetProvider,
+    refreshedAt: new Date().toISOString(),
+  };
+
+  rewriteSessionIndexUpserting([nextRow]);
+  replaceThreadGlobalState(globalState, sourceId, targetId);
+  return { sourceId, targetId, targetProvider, rolloutPath: targetRow.rollout_path, refreshed: true };
+}
+
 async function syncThreads(ids, targetProviders) {
   const targets = Array.from(new Set((targetProviders || []).map(String).filter(Boolean)));
   if (!targets.length) throw new Error("At least one target provider is required.");
@@ -1005,20 +1445,31 @@ async function syncThreads(ids, targetProviders) {
   if (!selected.length) throw new Error("No matching conversations were found.");
 
   const managerState = readManagerState();
+  const existing = new Map();
+  for (const row of allRows) {
+    const key = `${syncKeyForThread(row, managerState)}::${row.model_provider}`;
+    const current = existing.get(key);
+    if (!current || threadUpdatedAtMs(row) > threadUpdatedAtMs(current)) existing.set(key, row);
+  }
+  const backupRollouts = new Set(selected.map((thread) => thread.rollout_path));
+  for (const row of selected) {
+    const syncKey = syncKeyForThread(row, managerState);
+    for (const target of targets) {
+      const targetRow = existing.get(`${syncKey}::${target}`);
+      if (targetRow) backupRollouts.add(targetRow.rollout_path);
+    }
+  }
+
   const backupDir = await createBackup("sync", {
-    rolloutPaths: selected.map((thread) => thread.rollout_path),
+    rolloutPaths: Array.from(backupRollouts),
     includeSessionIndex: true,
     includeManagerState: true,
     includeGlobalState: true,
   });
   const globalState = readGlobalState();
 
-  const existing = new Set();
-  for (const row of allRows) {
-    existing.add(`${syncKeyForThread(row, managerState)}::${row.model_provider}`);
-  }
-
   const created = [];
+  const refreshed = [];
   const skipped = [];
   for (const row of selected) {
     const syncKey = syncKeyForThread(row, managerState);
@@ -1028,19 +1479,26 @@ async function syncThreads(ids, targetProviders) {
         continue;
       }
       const key = `${syncKey}::${target}`;
-      if (existing.has(key)) {
-        skipped.push({ sourceId: row.id, targetProvider: target, reason: "already-exists" });
+      const targetRow = existing.get(key);
+      if (targetRow) {
+        if (threadUpdatedAtMs(row) > threadUpdatedAtMs(targetRow)) {
+          const result = await replaceExistingSyncedThread(row, targetRow, target, managerState, globalState);
+          existing.set(key, { ...row, id: result.targetId, rollout_path: result.rolloutPath, model_provider: target });
+          refreshed.push(result);
+        } else {
+          skipped.push({ sourceId: row.id, targetProvider: target, reason: "already-up-to-date" });
+        }
         continue;
       }
       const result = await insertDuplicateThread(row, target, managerState, globalState);
-      existing.add(key);
+      existing.set(key, { ...row, id: result.newId, rollout_path: result.rolloutPath, model_provider: target });
       created.push(result);
     }
   }
 
   writeManagerState(managerState);
   writeGlobalState(globalState);
-  return { changed: created.length, created, skipped, backupDir };
+  return { changed: created.length + refreshed.length, created, refreshed, skipped, backupDir };
 }
 
 async function syncAllThreads() {
@@ -1050,13 +1508,6 @@ async function syncAllThreads() {
   if (providers.length < 2) throw new Error("At least two providers are required to sync all conversations.");
 
   const managerState = readManagerState();
-  const backupDir = await createBackup("sync-all", {
-    rolloutPaths: allRows.map((thread) => thread.rollout_path),
-    includeSessionIndex: true,
-    includeManagerState: true,
-    includeGlobalState: true,
-  });
-  const globalState = readGlobalState();
 
   const groups = new Map();
   for (const row of allRows) {
@@ -1065,15 +1516,35 @@ async function syncAllThreads() {
     groups.get(syncKey).push(row);
   }
 
+  const backupDir = await createBackup("sync-all", {
+    rolloutPaths: allRows.map((thread) => thread.rollout_path),
+    includeSessionIndex: true,
+    includeManagerState: true,
+    includeGlobalState: true,
+  });
+  const globalState = readGlobalState();
+
   const created = [];
+  const refreshed = [];
   const skipped = [];
   for (const [syncKey, group] of groups.entries()) {
-    const byProvider = new Map(group.map((row) => [row.model_provider, row]));
-    const preferredSource = group.find((row) => !managerState.threads[row.id]) || group[0];
+    const sorted = [...group].sort((a, b) => threadUpdatedAtMs(b) - threadUpdatedAtMs(a));
+    const byProvider = new Map();
+    for (const row of sorted) {
+      if (!byProvider.has(row.model_provider)) byProvider.set(row.model_provider, row);
+    }
+    const preferredSource = sorted.find((row) => row.rollout_path && fs.existsSync(row.rollout_path)) || sorted[0];
 
     for (const provider of providers) {
-      if (byProvider.has(provider)) {
-        skipped.push({ syncKey, targetProvider: provider, reason: "already-exists" });
+      const targetRow = byProvider.get(provider);
+      if (targetRow) {
+        if (targetRow.id !== preferredSource.id && threadUpdatedAtMs(preferredSource) > threadUpdatedAtMs(targetRow)) {
+          const result = await replaceExistingSyncedThread(preferredSource, targetRow, provider, managerState, globalState);
+          byProvider.set(provider, { ...preferredSource, id: result.targetId, rollout_path: result.rolloutPath, model_provider: provider });
+          refreshed.push(result);
+        } else {
+          skipped.push({ syncKey, targetProvider: provider, reason: "already-up-to-date" });
+        }
         continue;
       }
 
@@ -1085,7 +1556,7 @@ async function syncAllThreads() {
 
   writeManagerState(managerState);
   writeGlobalState(globalState);
-  return { changed: created.length, created, skipped, backupDir };
+  return { changed: created.length + refreshed.length, created, refreshed, skipped, backupDir };
 }
 
 function candidateSourceIdsForCopy(copyId, managerEntry, groupsBySyncKey) {
@@ -1192,7 +1663,8 @@ async function saveProviderConfig(rawConfig) {
   const backupDir = await createBackup("save-provider", {
     rolloutPaths: rows.map((thread) => thread.rollout_path),
     includeConfig: true,
-    includeManagerState: isRename,
+    includeAuth: true,
+    includeManagerState: true,
   });
 
   const configChanged = updateProviderInConfig(provider, {
@@ -1200,12 +1672,17 @@ async function saveProviderConfig(rawConfig) {
     activeProvider: currentConfig.activeProvider === oldProvider ? provider.name : undefined,
   });
   const renamed = await renameProviderInThreads(oldProvider, provider.name, rows);
+  const authRename = isRename
+    ? renameAuthForProvider(oldProvider, provider.name)
+    : { changed: false, action: "unchanged" };
 
   return {
-    changed: Number(configChanged) + renamed.changed + Number(renamed.managerStateChanged),
+    changed: Number(configChanged) + renamed.changed + Number(renamed.managerStateChanged) + Number(authRename.changed),
     configChanged,
     renamedThreads: renamed.changed,
     managerStateChanged: renamed.managerStateChanged,
+    authChanged: authRename.changed,
+    authAction: authRename.action,
     provider: provider.name,
     backupDir,
   };
@@ -1215,6 +1692,20 @@ async function switchProvider(rawConfig) {
   const input = rawConfig || {};
   const providerName = String(input.provider || "").trim();
   if (!providerName) throw new Error("Provider name is required.");
+
+  if (isOpenAiAuthProvider(providerName)) {
+    const config = readConfig();
+    const backupDir = await createBackup("switch-provider", { includeConfig: true, includeAuth: true, includeManagerState: true });
+    const configChanged = updateActiveProviderOnly(providerName);
+    const authResult = syncAuthForProviderSwitch(config.activeProvider, providerName);
+    return {
+      changed: Number(configChanged) + Number(authResult.authChanged),
+      configChanged,
+      activeProvider: providerName,
+      ...authResult,
+      backupDir,
+    };
+  }
 
   const config = readConfig();
   const existing = config.providers.get(providerName);
@@ -1226,18 +1717,23 @@ async function switchProvider(rawConfig) {
     envKey: input.envKey ?? input.env_key ?? (existing ? existing.envKey : ""),
   });
 
-  const backupDir = await createBackup("switch-provider", { includeConfig: true });
+  const backupDir = await createBackup("switch-provider", { includeConfig: true, includeAuth: true, includeManagerState: true });
   const configChanged = updateProviderInConfig(provider, { activeProvider: provider.name });
+  const authResult = syncAuthForProviderSwitch(config.activeProvider, provider.name);
   return {
-    changed: Number(configChanged),
+    changed: Number(configChanged) + Number(authResult.authChanged),
     configChanged,
     activeProvider: provider.name,
+    ...authResult,
     backupDir,
   };
 }
 
 async function deleteProvider(providerName, deleteConversations) {
   if (!providerName) throw new Error("Provider name is required.");
+  if (isOpenAiAuthProvider(providerName)) {
+    throw new Error('The built-in "openai" provider cannot be deleted.');
+  }
   const allRows = await getAllThreadRows();
   const matchingThreads = allRows.filter((row) => row.model_provider === providerName);
   const config = readConfig();
@@ -1247,12 +1743,14 @@ async function deleteProvider(providerName, deleteConversations) {
   const backupDir = await createBackup("delete-provider", {
     rolloutPaths: deleteConversations ? matchingThreads.map((thread) => thread.rollout_path) : [],
     includeConfig: true,
+    includeAuth: true,
     includeSessionIndex: true,
     includeManagerState: true,
     includeGlobalState: true,
   });
 
   const configChanged = removeProviderFromConfig(providerName, replacement);
+  const authCleanup = cleanupAuthForProvider(providerName);
   let deletedThreads = 0;
   let trashPaths = [];
 
@@ -1284,7 +1782,700 @@ async function deleteProvider(providerName, deleteConversations) {
     deletedThreads = matchingThreads.length;
   }
 
-  return { changed: Number(configChanged) + deletedThreads, configChanged, deletedThreads, backupDir, trashPaths };
+  return {
+    changed: Number(configChanged) + deletedThreads + Number(authCleanup.changed),
+    configChanged,
+    deletedThreads,
+    authChanged: authCleanup.changed,
+    authAction: authCleanup.action,
+    backupDir,
+    trashPaths,
+  };
+}
+
+function getClaudeHome() {
+  const candidates = [
+    process.env.CLAUDE_HOME,
+    path.join(os.homedir(), ".claude"),
+    path.join(os.homedir(), ".config", "claude"),
+  ].filter(Boolean);
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
+}
+
+function claudeSettingsPath() {
+  return path.join(getClaudeHome(), "settings.json");
+}
+
+function claudeConfigPath() {
+  return path.join(getClaudeHome(), "config.json");
+}
+
+function claudeProvidersPath() {
+  return path.join(getClaudeHome(), "provider-manager-providers.json");
+}
+
+function claudeHistoryPath() {
+  return path.join(getClaudeHome(), "history.jsonl");
+}
+
+function claudeProjectsPath() {
+  return path.join(getClaudeHome(), "projects");
+}
+
+function readJsonFile(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonFile(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function maskSecretValue(key, value) {
+  if (value === null || value === undefined) return value;
+  const lower = String(key || "").toLowerCase();
+  if (!/(token|key|secret|password|credential|auth)/.test(lower)) return value;
+  const text = String(value);
+  if (!text) return "";
+  if (text.length <= 8) return "********";
+  return `${text.slice(0, 4)}...${text.slice(-4)}`;
+}
+
+function maskSecrets(value, key = "") {
+  if (Array.isArray(value)) return value.map((item) => maskSecrets(item, key));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([entryKey, entryValue]) => [
+      entryKey,
+      maskSecrets(entryValue, entryKey),
+    ]));
+  }
+  return maskSecretValue(key, value);
+}
+
+function readClaudeProviderStore() {
+  const parsed = readJsonFile(claudeProvidersPath());
+  const providers = parsed && parsed.providers && typeof parsed.providers === "object" ? parsed.providers : {};
+  return {
+    version: APP_VERSION,
+    activeProvider: parsed && parsed.activeProvider ? String(parsed.activeProvider) : "",
+    providers,
+  };
+}
+
+function writeClaudeProviderStore(store) {
+  writeJsonFile(claudeProvidersPath(), {
+    version: APP_VERSION,
+    activeProvider: store.activeProvider || "",
+    providers: store.providers || {},
+  });
+}
+
+function currentClaudeEnv(settings) {
+  settings = settings && typeof settings === "object" ? settings : {};
+  const env = settings && settings.env && typeof settings.env === "object" ? settings.env : {};
+  return {
+    baseUrl: String(env.ANTHROPIC_BASE_URL || settings.ANTHROPIC_BASE_URL || ""),
+    authToken: String(env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY || settings.ANTHROPIC_AUTH_TOKEN || settings.ANTHROPIC_API_KEY || ""),
+    model: String(env.ANTHROPIC_MODEL || settings.ANTHROPIC_MODEL || ""),
+    opusModel: String(env.ANTHROPIC_DEFAULT_OPUS_MODEL || settings.ANTHROPIC_DEFAULT_OPUS_MODEL || ""),
+    sonnetModel: String(env.ANTHROPIC_DEFAULT_SONNET_MODEL || settings.ANTHROPIC_DEFAULT_SONNET_MODEL || ""),
+    haikuModel: String(env.ANTHROPIC_DEFAULT_HAIKU_MODEL || settings.ANTHROPIC_DEFAULT_HAIKU_MODEL || ""),
+  };
+}
+
+function storedClaudeProviderValue(provider, camelKey, snakeKey) {
+  return provider && (provider[camelKey] || provider[snakeKey] || "");
+}
+
+function normalizeClaudeProviderConfig(raw, existing = null) {
+  const providerName = String(raw.name || raw.provider || raw.nameKey || "").trim();
+  const displayName = providerName;
+  const baseUrl = String(raw.baseUrl || raw.base_url || "").trim();
+  const authToken = String(raw.authToken || raw.auth_token || raw.envKey || raw.env_key || "").trim();
+  const model = String(raw.model || raw.anthropicModel || "").trim();
+  const opusModel = String(raw.opusModel || raw.opus_model || raw.anthropicOpusModel || "").trim();
+  const sonnetModel = String(raw.sonnetModel || raw.sonnet_model || raw.anthropicSonnetModel || "").trim();
+  const haikuModel = String(raw.haikuModel || raw.haiku_model || raw.anthropicHaikuModel || "").trim();
+  const oldProvider = String(raw.oldProvider || raw.old_provider || providerName).trim();
+
+  if (!providerName) throw new Error("Provider name is required.");
+  if (!displayName) throw new Error("Provider display name is required.");
+  if (!baseUrl) throw new Error("Claude base_url is required.");
+  if (!authToken && !(existing && existing.authToken)) throw new Error("Claude auth token is required.");
+  if (!model) throw new Error("Claude model is required.");
+  if (!opusModel) throw new Error("Claude opus_model is required.");
+  if (!sonnetModel) throw new Error("Claude sonnet_model is required.");
+  if (!haikuModel) throw new Error("Claude haiku_model is required.");
+
+  return {
+    oldProvider,
+    name: providerName,
+    displayName,
+    baseUrl,
+    authToken: authToken || (existing && existing.authToken) || "",
+    model,
+    opusModel,
+    sonnetModel,
+    haikuModel,
+  };
+}
+
+function claudeProviderMatchesCurrent(provider, current) {
+  if (!provider || !current) return false;
+  return String(provider.baseUrl || "") === String(current.baseUrl || "")
+    && String(provider.authToken || "") === String(current.authToken || "")
+    && String(provider.model || "") === String(current.model || "")
+    && String(provider.opusModel || "") === String(current.opusModel || "")
+    && String(provider.sonnetModel || "") === String(current.sonnetModel || "")
+    && String(provider.haikuModel || "") === String(current.haikuModel || "");
+}
+
+function publicClaudeProvider(provider, active) {
+  return {
+    name: provider.name,
+    displayName: provider.displayName || provider.name,
+    baseUrl: provider.baseUrl || "",
+    envKey: provider.authToken ? maskSecretValue("ANTHROPIC_AUTH_TOKEN", provider.authToken) : "",
+    hasAuthToken: Boolean(provider.authToken),
+    model: provider.model || "",
+    opusModel: provider.opusModel || "",
+    sonnetModel: provider.sonnetModel || "",
+    haikuModel: provider.haikuModel || "",
+    configured: true,
+    active: Boolean(active),
+    virtual: Boolean(provider.virtual),
+  };
+}
+
+function buildClaudeProviderState(settings) {
+  const store = readClaudeProviderStore();
+  const current = currentClaudeEnv(settings);
+  const providers = [];
+  let activeProvider = "";
+
+  for (const [name, provider] of Object.entries(store.providers || {})) {
+    const normalized = {
+      name,
+      displayName: provider.displayName || provider.name || name,
+      baseUrl: storedClaudeProviderValue(provider, "baseUrl", "base_url"),
+      authToken: provider.authToken || "",
+      model: provider.model || "",
+      opusModel: storedClaudeProviderValue(provider, "opusModel", "opus_model"),
+      sonnetModel: storedClaudeProviderValue(provider, "sonnetModel", "sonnet_model"),
+      haikuModel: storedClaudeProviderValue(provider, "haikuModel", "haiku_model"),
+    };
+    const active = claudeProviderMatchesCurrent(normalized, current);
+    if (active) activeProvider = name;
+    providers.push(publicClaudeProvider(normalized, active));
+  }
+
+  if (!activeProvider && (current.baseUrl || current.authToken)) {
+    activeProvider = "__current__";
+    providers.unshift(publicClaudeProvider({
+      name: "__current__",
+      displayName: current.model ? `当前设置 (${current.model})` : "当前设置",
+      baseUrl: current.baseUrl,
+      authToken: current.authToken,
+      model: current.model,
+      opusModel: current.opusModel,
+      sonnetModel: current.sonnetModel,
+      haikuModel: current.haikuModel,
+      virtual: true,
+    }, true));
+  }
+
+  providers.sort((a, b) => {
+    if (a.active !== b.active) return a.active ? -1 : 1;
+    if (a.virtual !== b.virtual) return a.virtual ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  return { providers, activeProvider };
+}
+
+function applyClaudeProviderToSettings(provider) {
+  const file = claudeSettingsPath();
+  const settings = readJsonFile(file) || {};
+  if (!settings.env || typeof settings.env !== "object" || Array.isArray(settings.env)) settings.env = {};
+  settings.env.ANTHROPIC_BASE_URL = provider.baseUrl;
+  settings.env.ANTHROPIC_AUTH_TOKEN = provider.authToken;
+  settings.env.ANTHROPIC_MODEL = provider.model;
+  settings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = provider.haikuModel;
+  settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL = provider.sonnetModel;
+  settings.env.ANTHROPIC_DEFAULT_OPUS_MODEL = provider.opusModel;
+  writeJsonFile(file, settings);
+}
+
+function safeRelativeFromClaudeHome(filePath) {
+  const home = path.resolve(getClaudeHome());
+  const absolute = path.resolve(filePath);
+  const relative = path.relative(home, absolute);
+  if (!relative.startsWith("..") && !path.isAbsolute(relative)) return relative;
+  const hash = crypto.createHash("sha1").update(absolute).digest("hex").slice(0, 12);
+  return path.join("external", `${hash}-${path.basename(filePath)}`);
+}
+
+function createClaudeBackup(label, files = []) {
+  const backupRoot = path.join(getClaudeHome(), "provider-manager-backups");
+  const backupDir = path.join(backupRoot, `${timestampForPath()}-${label.replace(/[^A-Za-z0-9_-]/g, "-")}-${crypto.randomUUID().slice(0, 8)}`);
+  fs.mkdirSync(backupDir, { recursive: true });
+
+  const copied = [];
+  for (const file of files) {
+    if (!file || !fs.existsSync(file)) continue;
+    const destination = path.join(backupDir, "files", safeRelativeFromClaudeHome(file));
+    copyFileWithParents(file, destination);
+    copied.push(file);
+  }
+
+  fs.writeFileSync(
+    path.join(backupDir, "manifest.json"),
+    `${JSON.stringify({ createdAt: new Date().toISOString(), label, claudeHome: getClaudeHome(), copied }, null, 2)}\n`,
+    "utf8"
+  );
+
+  return backupDir;
+}
+
+async function saveClaudeProviderConfig(rawConfig) {
+  const store = readClaudeProviderStore();
+  const oldProvider = String(rawConfig.oldProvider || rawConfig.old_provider || rawConfig.provider || "").trim();
+  const settings = readJsonFile(claudeSettingsPath()) || {};
+  const current = currentClaudeEnv(settings);
+  const storedExisting = oldProvider && store.providers ? store.providers[oldProvider] : null;
+  const existing = storedExisting || (current.authToken ? { authToken: current.authToken } : null);
+  const provider = normalizeClaudeProviderConfig(rawConfig || {}, existing);
+  const isRename = provider.oldProvider && provider.oldProvider !== provider.name;
+  const backupDir = createClaudeBackup("save-claude-provider", [claudeSettingsPath(), claudeProvidersPath()]);
+
+  if (isRename && store.providers[provider.oldProvider]) delete store.providers[provider.oldProvider];
+  store.providers[provider.name] = {
+    displayName: provider.displayName,
+    baseUrl: provider.baseUrl,
+    base_url: provider.baseUrl,
+    authToken: provider.authToken,
+    auth_token: provider.authToken,
+    model: provider.model,
+    anthropic_model: provider.model,
+    opusModel: provider.opusModel,
+    opus_model: provider.opusModel,
+    sonnetModel: provider.sonnetModel,
+    sonnet_model: provider.sonnetModel,
+    haikuModel: provider.haikuModel,
+    haiku_model: provider.haikuModel,
+    updatedAt: new Date().toISOString(),
+  };
+
+  store.activeProvider = provider.name;
+  applyClaudeProviderToSettings(provider);
+
+  writeClaudeProviderStore(store);
+  return { changed: 2, provider: provider.name, backupDir };
+}
+
+async function switchClaudeProvider(rawConfig) {
+  const providerName = String(rawConfig.provider || "").trim();
+  if (!providerName) throw new Error("Provider name is required.");
+  if (providerName === "__current__") return { changed: 0, activeProvider: providerName, backupDir: null };
+
+  const store = readClaudeProviderStore();
+  const stored = store.providers[providerName];
+  if (!stored) throw new Error("Claude provider profile was not found.");
+
+  const provider = normalizeClaudeProviderConfig({
+    provider: providerName,
+    oldProvider: providerName,
+    name: providerName,
+    baseUrl: storedClaudeProviderValue(stored, "baseUrl", "base_url"),
+    authToken: stored.authToken,
+    model: stored.model,
+    opusModel: storedClaudeProviderValue(stored, "opusModel", "opus_model"),
+    sonnetModel: storedClaudeProviderValue(stored, "sonnetModel", "sonnet_model"),
+    haikuModel: storedClaudeProviderValue(stored, "haikuModel", "haiku_model"),
+  });
+  const backupDir = createClaudeBackup("switch-claude-provider", [claudeSettingsPath(), claudeProvidersPath()]);
+  applyClaudeProviderToSettings(provider);
+  store.activeProvider = provider.name;
+  writeClaudeProviderStore(store);
+  return { changed: 1, activeProvider: provider.name, backupDir };
+}
+
+async function deleteClaudeProvider(providerName) {
+  if (!providerName) throw new Error("Provider name is required.");
+  if (providerName === "__current__") throw new Error("当前设置是从 settings.json 读取的临时配置，请先保存为 provider 后再删除。");
+
+  const store = readClaudeProviderStore();
+  if (!store.providers[providerName]) throw new Error("Claude provider profile was not found.");
+  const backupDir = createClaudeBackup("delete-claude-provider", [claudeProvidersPath()]);
+  delete store.providers[providerName];
+  if (store.activeProvider === providerName) store.activeProvider = "";
+  writeClaudeProviderStore(store);
+  return { changed: 1, backupDir };
+}
+
+function listClaudeSessionFiles() {
+  const root = claudeProjectsPath();
+  if (!fs.existsSync(root)) return [];
+  const files = [];
+
+  function walk(directory) {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const filePath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === "provider-manager-trash") continue;
+        walk(filePath);
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".jsonl")) {
+        files.push(filePath);
+      }
+    }
+  }
+
+  walk(root);
+  return files;
+}
+
+function readClaudeHistory() {
+  const file = claudeHistoryPath();
+  const bySession = new Map();
+  let count = 0;
+  if (!fs.existsSync(file)) return { count, bySession };
+
+  const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      count += 1;
+      if (!entry.sessionId) continue;
+      const current = bySession.get(entry.sessionId) || {
+        sessionId: entry.sessionId,
+        displays: [],
+        project: "",
+        latestAtMs: 0,
+      };
+      if (entry.display && !current.displays.includes(entry.display)) current.displays.push(entry.display);
+      if (entry.project) current.project = entry.project;
+      const timestamp = Number(entry.timestamp || 0);
+      if (timestamp > current.latestAtMs) current.latestAtMs = timestamp;
+      bySession.set(entry.sessionId, current);
+    } catch {
+      // Claude history can be user-edited; skip malformed entries.
+    }
+  }
+
+  return { count, bySession };
+}
+
+function stripAnsi(text) {
+  return String(text || "").replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function compactWhitespace(text) {
+  return stripAnsi(text).replace(/\s+/g, " ").trim();
+}
+
+function stripClaudeCommandMarkup(text) {
+  return String(text || "")
+    .replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/gi, "")
+    .replace(/<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/gi, "$1")
+    .replace(/<command-message>([\s\S]*?)<\/command-message>/gi, "$1")
+    .replace(/<command-name>([\s\S]*?)<\/command-name>/gi, "$1")
+    .replace(/<command-args>([\s\S]*?)<\/command-args>/gi, "$1")
+    .trim();
+}
+
+function isClaudeNoiseText(text) {
+  const trimmed = String(text || "").trim();
+  return !trimmed
+    || trimmed.startsWith("<local-command-caveat>")
+    || trimmed.startsWith("<command-name>")
+    || trimmed.startsWith("<local-command-stdout>")
+    || trimmed === "/model"
+    || trimmed === "\\model";
+}
+
+function claudeContentPartToText(part) {
+  if (part === null || part === undefined) return "";
+  if (typeof part === "string") return part;
+  if (typeof part !== "object") return String(part);
+  if (typeof part.text === "string") return part.text;
+  if (typeof part.content === "string") return part.content;
+  if (typeof part.name === "string" && part.type) return `[${part.type}] ${part.name}`;
+  if (part.type === "image" || part.type === "image_url") return "[image]";
+  if (part.type === "document") return `[document] ${part.title || part.name || ""}`.trim();
+  if (part.type === "thinking") return "";
+  if (part.type === "tool_use") return `[tool_use] ${part.name || ""}`.trim();
+  if (part.type === "tool_result") return "[tool_result]";
+  if (part.type) return `[${part.type}]`;
+  return "[attachment]";
+}
+
+function claudeMessageContentToText(content) {
+  if (Array.isArray(content)) {
+    return content.map(claudeContentPartToText).filter(Boolean).join("\n\n").trim();
+  }
+  return claudeContentPartToText(content).trim();
+}
+
+function extractClaudeChatMessage(entry, lineNumber) {
+  if (!entry || (entry.type !== "user" && entry.type !== "assistant")) return null;
+  const payload = entry.message && typeof entry.message === "object" ? entry.message : {};
+  const role = payload.role || entry.type;
+  if (role !== "user" && role !== "assistant") return null;
+
+  const rawText = claudeMessageContentToText(payload.content);
+  const text = trimClaudeMessageText(stripClaudeCommandMarkup(rawText));
+  if (!text || isClaudeNoiseText(rawText)) return null;
+
+  return {
+    lineNumber,
+    timestamp: entry.timestamp || "",
+    role,
+    text,
+  };
+}
+
+function claudeTitleFromText(text) {
+  const cleaned = compactWhitespace(stripClaudeCommandMarkup(text));
+  if (!cleaned || isClaudeNoiseText(cleaned)) return "";
+  if (cleaned.length <= MAX_CLAUDE_TITLE_CHARS) return cleaned;
+  return `${cleaned.slice(0, MAX_CLAUDE_TITLE_CHARS)}...`;
+}
+
+async function parseClaudeSessionFile(filePath, historyEntry = null, options = {}) {
+  const stats = fs.statSync(filePath);
+  const messages = [];
+  let parseErrors = 0;
+  let rawEntryCount = 0;
+  let userMessageCount = 0;
+  let assistantMessageCount = 0;
+  let title = "";
+  let preview = "";
+  let cwd = historyEntry ? historyEntry.project || "" : "";
+  let version = "";
+  let firstAtMs = 0;
+  let latestAtMs = Number(stats.mtimeMs || 0);
+
+  const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+  const reader = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  let lineNumber = 0;
+
+  for await (const line of reader) {
+    lineNumber += 1;
+    if (!line.trim()) continue;
+    rawEntryCount += 1;
+
+    try {
+      const entry = JSON.parse(line);
+      if (entry.cwd && !cwd) cwd = entry.cwd;
+      if (entry.version && !version) version = entry.version;
+      const timestampMs = Date.parse(entry.timestamp || "");
+      if (Number.isFinite(timestampMs)) {
+        if (!firstAtMs || timestampMs < firstAtMs) firstAtMs = timestampMs;
+        if (timestampMs > latestAtMs) latestAtMs = timestampMs;
+      }
+
+      const message = extractClaudeChatMessage(entry, lineNumber);
+      if (!message) continue;
+      if (message.role === "user") userMessageCount += 1;
+      if (message.role === "assistant") assistantMessageCount += 1;
+      if (!title && message.role === "user") title = claudeTitleFromText(message.text);
+      if (!preview) preview = claudeTitleFromText(message.text);
+      if (!options.summaryOnly) messages.push(message);
+    } catch {
+      parseErrors += 1;
+    }
+  }
+
+  if (!title && historyEntry && historyEntry.displays && historyEntry.displays.length) {
+    title = claudeTitleFromText(historyEntry.displays.find((display) => !isClaudeNoiseText(display)) || historyEntry.displays[0]);
+  }
+  if (!title) title = path.basename(filePath, ".jsonl");
+  if (!preview) preview = title;
+
+  return {
+    id: path.basename(filePath, ".jsonl"),
+    title,
+    preview,
+    cwd,
+    projectKey: path.basename(path.dirname(filePath)),
+    projectPath: cwd || (historyEntry && historyEntry.project) || "",
+    filePath,
+    fileSize: stats.size,
+    createdAtMs: firstAtMs || Number(stats.birthtimeMs || stats.ctimeMs || 0),
+    updatedAtMs: latestAtMs || Number(stats.mtimeMs || 0),
+    version,
+    rawEntryCount,
+    messageCount: userMessageCount + assistantMessageCount,
+    userMessageCount,
+    assistantMessageCount,
+    parseErrors,
+    messages,
+  };
+}
+
+function buildClaudeProjects(sessions) {
+  const projects = new Map();
+  for (const session of sessions) {
+    const key = session.projectKey || "Unknown";
+    const current = projects.get(key) || {
+      key,
+      path: session.projectPath || session.cwd || "",
+      sessionCount: 0,
+      messageCount: 0,
+      latestUpdatedAtMs: 0,
+    };
+    current.sessionCount += 1;
+    current.messageCount += session.messageCount || 0;
+    if (!current.path && (session.projectPath || session.cwd)) current.path = session.projectPath || session.cwd;
+    current.latestUpdatedAtMs = Math.max(current.latestUpdatedAtMs, session.updatedAtMs || 0);
+    projects.set(key, current);
+  }
+
+  return Array.from(projects.values()).sort((a, b) => b.latestUpdatedAtMs - a.latestUpdatedAtMs);
+}
+
+async function readClaudeState() {
+  const home = getClaudeHome();
+  const settings = readJsonFile(claudeSettingsPath());
+  const config = readJsonFile(claudeConfigPath());
+  const providerState = buildClaudeProviderState(settings || {});
+  const history = readClaudeHistory();
+  const files = listClaudeSessionFiles();
+  const sessions = [];
+
+  for (const filePath of files) {
+    const id = path.basename(filePath, ".jsonl");
+    sessions.push(await parseClaudeSessionFile(filePath, history.bySession.get(id), { summaryOnly: true }));
+  }
+
+  sessions.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+
+  return {
+    claudeHome: home,
+    settingsPath: claudeSettingsPath(),
+    configPath: claudeConfigPath(),
+    historyPath: claudeHistoryPath(),
+    projectsPath: claudeProjectsPath(),
+    hasHome: fs.existsSync(home),
+    hasSettings: fs.existsSync(claudeSettingsPath()),
+    hasConfig: fs.existsSync(claudeConfigPath()),
+    settings: maskSecrets(settings || {}),
+    config: maskSecrets(config || {}),
+    model: settings && settings.model ? settings.model : "",
+    effortLevel: settings && settings.effortLevel ? settings.effortLevel : "",
+    env: maskSecrets(settings && settings.env ? settings.env : {}),
+    activeProvider: providerState.activeProvider,
+    providers: providerState.providers,
+    historyCount: history.count,
+    projects: buildClaudeProjects(sessions),
+    sessions,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+async function readClaudeSession(sessionId) {
+  if (!sessionId) throw new Error("Claude session id is required.");
+  const history = readClaudeHistory();
+  const filePath = listClaudeSessionFiles().find((candidate) => path.basename(candidate, ".jsonl") === sessionId);
+  if (!filePath) throw new Error("Claude session was not found.");
+  return parseClaudeSessionFile(filePath, history.bySession.get(sessionId), { summaryOnly: false });
+}
+
+function safeRelativeFromClaudeHome(filePath) {
+  const home = path.resolve(getClaudeHome());
+  const absolute = path.resolve(filePath);
+  const relative = path.relative(home, absolute);
+  if (!relative.startsWith("..") && !path.isAbsolute(relative)) return relative;
+  const hash = crypto.createHash("sha1").update(absolute).digest("hex").slice(0, 12);
+  return path.join("external", `${hash}-${path.basename(filePath)}`);
+}
+
+function moveClaudeSessionToTrash(filePath, trashRoot) {
+  const destination = path.join(trashRoot, safeRelativeFromClaudeHome(filePath));
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  try {
+    fs.renameSync(filePath, destination);
+  } catch {
+    fs.copyFileSync(filePath, destination);
+    fs.unlinkSync(filePath);
+  }
+  return destination;
+}
+
+async function deleteClaudeSessions(ids) {
+  const cleanIds = Array.from(new Set((ids || []).map(String).filter(Boolean)));
+  if (!cleanIds.length) throw new Error("No Claude session IDs were provided.");
+
+  const byId = new Map(listClaudeSessionFiles().map((filePath) => [path.basename(filePath, ".jsonl"), filePath]));
+  const missing = cleanIds.filter((id) => !byId.has(id));
+  if (missing.length) throw new Error(`Claude session was not found: ${missing[0]}`);
+
+  const trashRoot = path.join(getClaudeHome(), "provider-manager-trash", timestampForPath());
+  const trashPaths = [];
+  for (const id of cleanIds) {
+    trashPaths.push(moveClaudeSessionToTrash(byId.get(id), trashRoot));
+  }
+
+  return { changed: cleanIds.length, trashDir: trashRoot, trashPaths };
+}
+
+function collectPathStats(targetPath) {
+  if (!targetPath || !fs.existsSync(targetPath)) {
+    return { files: 0, directories: 0, bytes: 0 };
+  }
+
+  const stats = fs.lstatSync(targetPath);
+  if (!stats.isDirectory()) {
+    return { files: 1, directories: 0, bytes: Number(stats.size || 0) };
+  }
+
+  const total = { files: 0, directories: 1, bytes: 0 };
+  for (const entry of fs.readdirSync(targetPath, { withFileTypes: true })) {
+    const child = collectPathStats(path.join(targetPath, entry.name));
+    total.files += child.files;
+    total.directories += child.directories;
+    total.bytes += child.bytes;
+  }
+  return total;
+}
+
+function providerManagerBackupRoots() {
+  const roots = [
+    path.join(getCodexHome(), "provider-manager-backups"),
+    path.join(getClaudeHome(), "provider-manager-backups"),
+  ];
+  const seen = new Set();
+  return roots.filter((root) => {
+    const key = path.resolve(root).toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function cleanupProviderManagerBackups() {
+  const deleted = [];
+  for (const root of providerManagerBackupRoots()) {
+    if (!fs.existsSync(root)) continue;
+    const stats = collectPathStats(root);
+    fs.rmSync(root, { recursive: true, force: true });
+    deleted.push({ root, ...stats });
+  }
+
+  return {
+    changed: deleted.length,
+    deletedRoots: deleted.length,
+    deletedFiles: deleted.reduce((sum, item) => sum + item.files, 0),
+    deletedDirectories: deleted.reduce((sum, item) => sum + item.directories, 0),
+    deletedBytes: deleted.reduce((sum, item) => sum + item.bytes, 0),
+    roots: deleted.map((item) => item.root),
+  };
 }
 
 function contentTypeFor(filePath) {
@@ -1292,6 +2483,9 @@ function contentTypeFor(filePath) {
   if (filePath.endsWith(".css")) return "text/css; charset=utf-8";
   if (filePath.endsWith(".js")) return "application/javascript; charset=utf-8";
   if (filePath.endsWith(".json")) return "application/json; charset=utf-8";
+  if (filePath.endsWith(".svg")) return "image/svg+xml; charset=utf-8";
+  if (filePath.endsWith(".png")) return "image/png";
+  if (filePath.endsWith(".ico")) return "image/x-icon";
   return "application/octet-stream";
 }
 
@@ -1302,7 +2496,11 @@ function embeddedAssetName(requested) {
 function getEmbeddedAsset(requested) {
   if (!isSeaExecutable()) return null;
   try {
-    return sea.getAsset(embeddedAssetName(requested), "utf8");
+    const contentType = contentTypeFor(requested);
+    if (/^text\/|javascript|json|svg/.test(contentType)) {
+      return sea.getAsset(embeddedAssetName(requested), "utf8");
+    }
+    return Buffer.from(sea.getRawAsset(embeddedAssetName(requested)));
   } catch {
     return null;
   }
@@ -1342,6 +2540,11 @@ async function routeApi(req, res, url) {
       return;
     }
 
+    if (req.method === "GET" && pathname === "/api/claude/state") {
+      sendJson(res, 200, { ok: true, data: await readClaudeState() });
+      return;
+    }
+
     if (req.method === "GET" && pathname === "/api/thread") {
       const id = url.searchParams.get("id");
       if (!id) {
@@ -1349,6 +2552,16 @@ async function routeApi(req, res, url) {
         return;
       }
       sendJson(res, 200, { ok: true, data: await readConversation(id) });
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/claude/session") {
+      const id = url.searchParams.get("id");
+      if (!id) {
+        sendJson(res, 400, { ok: false, error: "Claude session id is required." });
+        return;
+      }
+      sendJson(res, 200, { ok: true, data: await readClaudeSession(id) });
       return;
     }
 
@@ -1371,6 +2584,8 @@ async function routeApi(req, res, url) {
       result = await syncThreads(body.ids || [], body.providers || []);
     } else if (pathname === "/api/sync-all") {
       result = await syncAllThreads();
+    } else if (pathname === "/api/cleanup-backups") {
+      result = cleanupProviderManagerBackups();
     } else if (pathname === "/api/repair-visibility") {
       result = await repairGlobalStateVisibility();
     } else if (pathname === "/api/provider/save") {
@@ -1379,6 +2594,14 @@ async function routeApi(req, res, url) {
       result = await switchProvider(body);
     } else if (pathname === "/api/provider/delete") {
       result = await deleteProvider(body.provider, Boolean(body.deleteConversations));
+    } else if (pathname === "/api/claude/provider/save") {
+      result = await saveClaudeProviderConfig(body);
+    } else if (pathname === "/api/claude/provider/switch") {
+      result = await switchClaudeProvider(body);
+    } else if (pathname === "/api/claude/provider/delete") {
+      result = await deleteClaudeProvider(body.provider);
+    } else if (pathname === "/api/claude/session/delete") {
+      result = await deleteClaudeSessions(body.ids || []);
     } else {
       sendJson(res, 404, { ok: false, error: "Unknown API route." });
       return;
@@ -1460,7 +2683,7 @@ function openDesktopWindow(url, server) {
     return;
   }
 
-  const profileDir = path.join(os.tmpdir(), `codex-provider-manager-${process.pid}`);
+  const profileDir = path.join(os.tmpdir(), `provider-manager-${process.pid}`);
   fs.mkdirSync(profileDir, { recursive: true });
   spawn(edge, [
     `--app=${url}`,
@@ -1486,6 +2709,18 @@ function startDesktopShutdownMonitor(server) {
   }, 5000);
 }
 
+function startAuthMonitor() {
+  if (authWatcherTimer) return;
+  setAuthWatcherBaselineFromFile();
+  authWatcherTimer = setInterval(() => {
+    try {
+      persistObservedAuthIfNeeded();
+    } catch {
+      // Keep the monitor best-effort; malformed files should not stop the server.
+    }
+  }, 2000);
+}
+
 function startServer() {
   const shouldOpenWindow = isSeaExecutable() || process.env.CPM_DESKTOP === "1";
 
@@ -1502,12 +2737,13 @@ function startServer() {
 
     server.listen(port, HOST, () => {
       const url = `http://${HOST}:${port}`;
-      console.log(`Codex Provider Manager running at ${url}`);
+      console.log(`ProviderManager running at ${url}`);
       console.log(`CODEX_HOME=${getCodexHome()}`);
       if (shouldOpenWindow) {
         openDesktopWindow(url, server);
         if (process.env.CPM_NO_AUTO_OPEN !== "1") startDesktopShutdownMonitor(server);
       }
+      startAuthMonitor();
     });
   }
 
@@ -1531,4 +2767,11 @@ module.exports = {
   saveProviderConfig,
   switchProvider,
   deleteProvider,
+  readClaudeState,
+  readClaudeSession,
+  saveClaudeProviderConfig,
+  switchClaudeProvider,
+  deleteClaudeProvider,
+  deleteClaudeSessions,
+  cleanupProviderManagerBackups,
 };

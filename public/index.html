@@ -3,82 +3,104 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Codex Provider Manager</title>
+    <title>ProviderManager</title>
+    <link rel="icon" href="/favicon.png" type="image/png" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div class="app-shell">
-      <aside class="sidebar">
+    <div id="pageShell" class="page-shell">
+      <header class="app-bar">
         <div class="brand">
-          <div class="brand-mark">CP</div>
-          <div>
-            <h1>Provider Manager</h1>
-            <p id="codexHome">Loading...</p>
+          <div class="brand-mark" aria-hidden="true"></div>
+          <div class="brand-copy">
+            <h1>ProviderManager</h1>
+            <p id="homePath">Loading...</p>
           </div>
         </div>
 
-        <button class="provider-item active" data-provider="__all__">
-          <span>全部对话</span>
-          <strong id="allCount">0</strong>
-        </button>
-        <div id="providerList" class="provider-list"></div>
-      </aside>
+        <div class="app-bar-actions">
+          <button id="cleanupBackupsBtn" class="ghost-btn" type="button">清理缓存</button>
+          <button id="syncAllBtn" class="primary-btn" type="button">同步全部</button>
+          <button id="reloadBtn" class="icon-btn" type="button" title="重新读取本地记录" aria-label="刷新">↻</button>
+        </div>
 
-      <main class="main">
-        <section class="toolbar">
-          <div class="toolbar-row">
-            <div class="search-box">
-              <span class="search-icon">⌕</span>
-              <input id="searchInput" type="search" placeholder="搜索标题、工作目录、模型或 ID" />
+        <div class="mode-switch" aria-label="管理目标">
+          <button class="mode-tab active" data-app="codex" type="button">Codex</button>
+          <button class="mode-tab" data-app="claude" type="button">Claude Code</button>
+        </div>
+      </header>
+
+      <div class="workspace-shell">
+        <aside id="sidebar" class="sidebar">
+          <div class="sidebar-head">
+            <div class="sidebar-title">
+              <span id="scopeTitle">Providers 共0项</span>
+              <small id="scopeMeta" hidden></small>
             </div>
-            <button id="reloadBtn" class="ghost-btn" title="重新读取 Codex 本地记录">刷新</button>
-            <button id="syncAllBtn" class="primary-btn" title="把每组对话补齐到所有 provider">同步全部</button>
+            <div class="sidebar-head-actions">
+              <button id="addProviderBtn" class="icon-btn add-provider-btn" type="button" title="添加 Provider" aria-label="添加 Provider">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg>
+              </button>
+              <button id="sidebarToggle" class="icon-btn sidebar-toggle" type="button" title="收起侧边栏" aria-label="收起侧边栏">‹</button>
+            </div>
           </div>
 
-          <div class="toolbar-row actions-row">
-            <span id="selectedCount" class="selection-count">未选择</span>
-            <select id="targetProvider"></select>
-            <button id="moveBtn" class="ghost-btn">移动</button>
-            <button id="syncBtn" class="ghost-btn">同步</button>
-            <button id="deleteBtn" class="danger-btn">删除</button>
-          </div>
+          <button id="allScopeButton" class="scope-item scope-item-primary active" data-scope="__all__" type="button">
+            <em id="allScopeIcon" class="scope-letter scope-logo scope-logo-codex" aria-hidden="true"></em>
+            <span>
+              <strong id="allScopeLabel">全部对话</strong>
+              <small id="allScopeMeta">所有 provider</small>
+            </span>
+            <b id="allCount">0</b>
+          </button>
 
-          <div class="toolbar-row filter-row">
-            <select id="modelFilter" title="按模型名称筛选"></select>
-            <input id="startDateFilter" type="date" title="更新时间起始日期" />
-            <input id="endDateFilter" type="date" title="更新时间结束日期" />
-            <select id="statusFilter" title="按状态筛选">
-              <option value="__all__">全部状态</option>
-              <option value="normal">正常</option>
-              <option value="archived">已归档</option>
-              <option value="synced">同步副本</option>
-              <option value="missing">文件缺失</option>
-              <option value="mismatch">Provider 不一致</option>
-            </select>
-            <button id="clearFiltersBtn" class="ghost-btn">清除筛选</button>
-          </div>
-        </section>
+          <div id="providerList" class="scope-list"></div>
+        </aside>
 
-        <section class="summary-grid" id="summaryGrid"></section>
+        <main class="main-panel">
+          <section class="hero-panel">
+            <div>
+              <div class="eyebrow" id="viewEyebrow">Codex</div>
+              <h2 id="viewTitle">对话与 Provider</h2>
+              <p id="viewSubtitle">管理 Codex provider、默认模型供应商和本地对话记录。</p>
+            </div>
+          </section>
 
-        <section class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th class="check-cell"><input id="selectAll" type="checkbox" /></th>
-                <th>对话</th>
-                <th>Provider</th>
-                <th>模型</th>
-                <th>更新时间</th>
-                <th>状态</th>
-                <th class="row-actions-head"></th>
-              </tr>
-            </thead>
-            <tbody id="threadRows"></tbody>
-          </table>
-          <div id="emptyState" class="empty-state" hidden>没有匹配的对话</div>
-        </section>
-      </main>
+          <section class="panel control-panel">
+            <div class="toolbar-row search-row">
+              <div class="search-box">
+                <span class="search-icon">⌕</span>
+                <input id="searchInput" type="search" placeholder="搜索标题、工作目录、模型或 ID" />
+              </div>
+              <button id="clearFiltersBtn" class="ghost-btn" type="button">清除筛选</button>
+            </div>
+
+            <div class="toolbar-row filter-row">
+              <select id="modelFilter" title="筛选"></select>
+              <input id="startDateFilter" type="date" title="更新时间起始日期" />
+              <input id="endDateFilter" type="date" title="更新时间结束日期" />
+              <select id="statusFilter" title="按状态筛选"></select>
+            </div>
+
+            <div class="toolbar-row action-row">
+              <label class="check-line compact">
+                <input id="selectAll" type="checkbox" />
+                <span>全选可见</span>
+              </label>
+              <span id="selectedCount" class="selection-count">未选择</span>
+              <select id="targetProvider" title="目标 provider"></select>
+              <button id="moveBtn" class="ghost-btn" type="button">移动</button>
+              <button id="syncBtn" class="ghost-btn" type="button">同步</button>
+              <button id="deleteBtn" class="danger-btn" type="button">删除</button>
+            </div>
+          </section>
+
+          <section class="summary-grid" id="summaryGrid"></section>
+
+          <section id="threadRows" class="record-grid"></section>
+          <div id="emptyState" class="empty-state" hidden>没有匹配的记录</div>
+        </main>
+      </div>
     </div>
 
     <dialog id="providerDialog">
@@ -96,32 +118,85 @@
       </form>
     </dialog>
 
-    <dialog id="providerConfigDialog">
-      <form id="providerConfigForm" class="dialog-card">
-        <h2 id="providerConfigTitle">配置 Provider</h2>
-        <p id="providerConfigText" hidden></p>
-        <input id="providerConfigOriginal" type="hidden" />
+    <dialog id="codexProviderConfigDialog" tabindex="-1">
+      <form id="codexProviderConfigForm" class="dialog-card">
+        <h2 id="codexProviderConfigTitle">配置 Codex Provider</h2>
+        <p id="codexProviderConfigText">保存后会写入 config.toml；如果修改 Provider 名，会同步更新该 provider 的对话记录。</p>
+        <input id="codexProviderConfigOriginal" type="hidden" />
         <div class="field-stack">
           <label>
             <span>Provider 名</span>
-            <input id="providerConfigKey" type="text" autocomplete="off" required />
+            <input id="codexProviderConfigKey" type="text" autocomplete="off" required />
           </label>
           <label>
             <span>name</span>
-            <input id="providerConfigName" type="text" autocomplete="off" required />
+            <input id="codexProviderConfigName" type="text" autocomplete="off" required />
           </label>
           <label>
             <span>base_url</span>
-            <input id="providerConfigBaseUrl" type="url" autocomplete="off" required />
+            <input id="codexProviderConfigBaseUrl" type="url" autocomplete="off" />
           </label>
           <label>
             <span>env_key</span>
-            <input id="providerConfigEnvKey" type="text" autocomplete="off" required />
+            <input id="codexProviderConfigEnvKey" type="text" autocomplete="off" />
           </label>
         </div>
         <div class="dialog-actions">
-          <button id="cancelProviderConfig" type="button" class="ghost-btn">取消</button>
-          <button id="confirmSaveProvider" type="submit" class="primary-btn">保存</button>
+          <button id="cancelCodexProviderConfig" type="button" class="ghost-btn">取消</button>
+          <button id="confirmSaveCodexProvider" type="submit" class="primary-btn">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="claudeProviderConfigDialog" tabindex="-1">
+      <form id="claudeProviderConfigForm" class="dialog-card">
+        <h2 id="claudeProviderConfigTitle">配置 Claude Provider</h2>
+        <p id="claudeProviderConfigText">保存后会写入 ProviderManager 的 Claude profiles，并同步更新 Claude Code settings.json。</p>
+        <input id="claudeProviderConfigOriginal" type="hidden" />
+        <div class="field-stack">
+          <label>
+            <span>name</span>
+            <input id="claudeProviderConfigName" type="text" autocomplete="off" required />
+          </label>
+          <label>
+            <span>base_url</span>
+            <input id="claudeProviderConfigBaseUrl" type="url" autocomplete="off" required />
+          </label>
+          <label>
+            <span>auth_token</span>
+            <input id="claudeProviderConfigAuthToken" type="text" autocomplete="off" required />
+          </label>
+          <label>
+            <span>model</span>
+            <input id="claudeProviderConfigModel" type="text" autocomplete="off" required />
+          </label>
+          <label>
+            <span>opus_model</span>
+            <input id="claudeProviderConfigOpusModel" type="text" autocomplete="off" required />
+          </label>
+          <label>
+            <span>sonnet_model</span>
+            <input id="claudeProviderConfigSonnetModel" type="text" autocomplete="off" required />
+          </label>
+          <label>
+            <span>haiku_model</span>
+            <input id="claudeProviderConfigHaikuModel" type="text" autocomplete="off" required />
+          </label>
+        </div>
+        <div class="dialog-actions">
+          <button id="cancelClaudeProviderConfig" type="button" class="ghost-btn">取消</button>
+          <button id="confirmSaveClaudeProvider" type="submit" class="primary-btn">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="confirmDialog">
+      <form method="dialog" class="dialog-card confirm-card">
+        <h2 id="confirmTitle">确认操作</h2>
+        <p id="confirmText"></p>
+        <div class="dialog-actions">
+          <button id="cancelConfirm" value="cancel" class="ghost-btn" type="button">取消</button>
+          <button id="confirmAction" value="confirm" class="danger-btn" type="button">确认</button>
         </div>
       </form>
     </dialog>
@@ -133,7 +208,7 @@
             <h2 id="threadDialogTitle">对话记录</h2>
             <p id="threadDialogMeta"></p>
           </div>
-          <button id="closeThreadDialog" class="ghost-btn" aria-label="关闭对话记录">关闭</button>
+          <button id="closeThreadDialog" class="icon-btn" type="button" aria-label="关闭">×</button>
         </header>
         <div id="threadMessages" class="thread-messages"></div>
       </div>

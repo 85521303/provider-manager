@@ -3,9 +3,10 @@ const path = require("path");
 const { execFileSync } = require("child_process");
 
 const root = __dirname;
-const dist = path.join(root, "dist");
-const blobPath = path.join(dist, "codex-provider-manager.blob");
-const exePath = path.join(dist, "CodexProviderManager.exe");
+const dist = path.resolve(root, process.env.CPM_EXE_OUT_DIR || path.join("dist", "sidecar"));
+const blobPath = path.join(dist, "provider-manager.blob");
+const executableName = process.platform === "win32" ? "ProviderManager.exe" : "provider-manager";
+const exePath = path.join(dist, executableName);
 const seaConfigPath = path.join(dist, "sea-config.json");
 const vendorDir = path.join(dist, "vendor");
 
@@ -40,6 +41,7 @@ function runNpx(args) {
 }
 
 function patchWindowsSubsystem(executablePath) {
+  if (process.platform !== "win32") return;
   const buffer = fs.readFileSync(executablePath);
   const peOffset = buffer.readUInt32LE(0x3c);
   const signature = buffer.toString("ascii", peOffset, peOffset + 4);
@@ -58,6 +60,16 @@ function patchWindowsSubsystem(executablePath) {
   }
 }
 
+function removeDarwinSignature(executablePath) {
+  if (process.platform !== "darwin") return;
+  run("codesign", ["--remove-signature", executablePath]);
+}
+
+function signDarwinAdHoc(executablePath) {
+  if (process.platform !== "darwin") return;
+  run("codesign", ["--sign", "-", executablePath]);
+}
+
 function firstCommandPath(command) {
   try {
     const output = execFileSync(process.platform === "win32" ? "where.exe" : "which", [command], {
@@ -73,30 +85,51 @@ function firstCommandPath(command) {
 function addSqliteAssets(assets) {
   const sqliteExe = process.env.SQLITE3_PATH || firstCommandPath(process.platform === "win32" ? "sqlite3.exe" : "sqlite3");
   if (!sqliteExe || !fs.existsSync(sqliteExe)) {
-    console.warn("sqlite3 was not found on PATH; the exe will use system sqlite3 if available at runtime.");
+    console.warn("sqlite3 was not found on PATH; the executable will use system sqlite3 if available at runtime.");
     return;
   }
 
   fs.mkdirSync(vendorDir, { recursive: true });
-  const copiedExe = path.join(vendorDir, "sqlite3.exe");
+  const copiedName = process.platform === "win32" ? "sqlite3.exe" : "sqlite3";
+  const copiedExe = path.join(vendorDir, copiedName);
   fs.copyFileSync(sqliteExe, copiedExe);
-  assets["vendor/sqlite3.exe"] = path.relative(root, copiedExe).replace(/\\/g, "/");
+  assets[`vendor/${copiedName}`] = path.relative(root, copiedExe).replace(/\\/g, "/");
 
-  const sqliteDll = path.join(path.dirname(sqliteExe), "sqlite3.dll");
-  if (fs.existsSync(sqliteDll)) {
+  const sqliteDll = process.platform === "win32" ? path.join(path.dirname(sqliteExe), "sqlite3.dll") : "";
+  if (sqliteDll && fs.existsSync(sqliteDll)) {
     const copiedDll = path.join(vendorDir, "sqlite3.dll");
     fs.copyFileSync(sqliteDll, copiedDll);
     assets["vendor/sqlite3.dll"] = path.relative(root, copiedDll).replace(/\\/g, "/");
   }
 }
 
+function collectFilesRecursively(baseDir, prefix) {
+  const assets = {};
+  if (!fs.existsSync(baseDir)) return assets;
+
+  function walk(currentDir) {
+    for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+      const absolutePath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        walk(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+
+      const relativePath = path.relative(baseDir, absolutePath).replace(/\\/g, "/");
+      assets[`${prefix}/${relativePath}`] = path.relative(root, absolutePath).replace(/\\/g, "/");
+    }
+  }
+
+  walk(baseDir);
+  return assets;
+}
+
 fs.rmSync(dist, { recursive: true, force: true });
 fs.mkdirSync(dist, { recursive: true });
 
 const assets = {
-  "public/index.html": "public/index.html",
-  "public/app.js": "public/app.js",
-  "public/styles.css": "public/styles.css",
+  ...collectFilesRecursively(path.join(root, "public"), "public"),
 };
 addSqliteAssets(assets);
 
@@ -111,8 +144,9 @@ fs.writeFileSync(seaConfigPath, `${JSON.stringify(seaConfig, null, 2)}\n`, "utf8
 run(process.execPath, ["--experimental-sea-config", seaConfigPath]);
 
 fs.copyFileSync(process.execPath, exePath);
+removeDarwinSignature(exePath);
 
-runNpx([
+const postjectArgs = [
   "--yes",
   "postject",
   exePath,
@@ -120,13 +154,21 @@ runNpx([
   blobPath,
   "--sentinel-fuse",
   "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2",
-]);
+];
+
+if (process.platform === "darwin") {
+  postjectArgs.push("--macho-segment-name", "NODE_SEA");
+}
+
+runNpx(postjectArgs);
 
 patchWindowsSubsystem(exePath);
+signDarwinAdHoc(exePath);
+if (process.platform !== "win32") fs.chmodSync(exePath, 0o755);
 fs.rmSync(blobPath, { force: true });
 fs.rmSync(seaConfigPath, { force: true });
 fs.rmSync(vendorDir, { recursive: true, force: true });
 
 console.log("");
 console.log(`Built ${exePath}`);
-console.log("Double-click the exe to open Codex Provider Manager.");
+console.log("Run the executable to open ProviderManager.");

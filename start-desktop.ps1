@@ -74,7 +74,7 @@ try {
 
   $edge = Find-Edge
   if ($edge) {
-    $profileDir = Join-Path $env:TEMP "codex-provider-manager-edge-profile"
+    $profileDir = Join-Path $env:TEMP "provider-manager-edge-profile"
     New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
     $edgeProcess = Start-Process -FilePath $edge `
       -ArgumentList @("--app=$url", "--window-size=1280,860", "--user-data-dir=$profileDir") `

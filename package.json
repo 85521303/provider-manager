@@ -1,14 +1,25 @@
 {
-  "name": "codex-provider-manager",
+  "name": "provider-manager",
   "version": "0.1.0",
   "private": true,
   "description": "Local web tool for moving, deleting, and syncing Codex conversations across model providers.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "desktop": "powershell -ExecutionPolicy Bypass -File ./start-desktop.ps1",
+    "desktop": "npm run tauri:icons && npm run tauri:dev",
     "build:exe": "node build-exe.js",
+    "tauri:prepare": "node scripts/prepare-tauri-sidecar.js",
+    "tauri:icons": "node scripts/generate-tauri-icons.js",
+    "cargo:mirror": "node scripts/setup-cargo-mirror.js",
+    "tauri:dev": "node scripts/tauri-with-dist-target.js dev",
+    "tauri:build": "npm run cargo:mirror && npm run tauri:icons && node scripts/tauri-with-dist-target.js build",
+    "build:desktop": "npm run tauri:build",
+    "build:desktop:windows": "scripts\\build-desktop.cmd",
     "check": "node --check server.js && node --check public/app.js"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.1",
+    "pngjs": "7.0.0"
   },
   "engines": {
     "node": ">=18"
