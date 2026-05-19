@@ -97,6 +97,50 @@ function sessionIndexPath() {
   return path.join(getCodexHome(), "session_index.jsonl");
 }
 
+function stripWindowsExtendedPathPrefix(value) {
+  const text = String(value || "").trim();
+  const extendedUncPrefix = "\\\\?\\UNC\\";
+  if (text.startsWith(extendedUncPrefix)) return `\\\\${text.slice(extendedUncPrefix.length)}`;
+  if (text.startsWith("\\\\?\\")) return text.slice(4);
+  return text;
+}
+
+function trimTrailingPathSeparators(value) {
+  let output = String(value || "");
+  if (!output) return output;
+  const root = path.parse(output).root;
+  while (output.length > root.length && /[\\/]$/.test(output)) {
+    output = output.slice(0, -1);
+  }
+  return output;
+}
+
+function normalizeProjectPath(value) {
+  const stripped = stripWindowsExtendedPathPrefix(value);
+  if (!stripped) throw new Error("Project path is required.");
+  return trimTrailingPathSeparators(path.resolve(stripped));
+}
+
+function normalizeExistingProjectDirectory(value) {
+  const resolved = normalizeProjectPath(value);
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+    throw new Error(`Project directory does not exist: ${resolved}`);
+  }
+  return resolved;
+}
+
+function projectPathCompareKey(value) {
+  const resolved = normalizeProjectPath(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function formatCwdForDatabase(projectPath, previousCwd) {
+  const clean = normalizeProjectPath(projectPath);
+  if (process.platform !== "win32" || !String(previousCwd || "").startsWith("\\\\?\\")) return clean;
+  if (clean.startsWith("\\\\")) return `\\\\?\\UNC\\${clean.slice(2)}`;
+  return `\\\\?\\${clean}`;
+}
+
 function sqlQuote(value) {
   if (value === null || value === undefined) return "NULL";
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
@@ -508,6 +552,53 @@ function removeFromArray(array, values) {
   if (next.length === array.length) return false;
   array.splice(0, array.length, ...next);
   return true;
+}
+
+function addUniqueProjectPath(array, value) {
+  if (!Array.isArray(array)) return false;
+  const targetKey = projectPathCompareKey(value);
+  if (array.some((item) => {
+    try {
+      return projectPathCompareKey(item) === targetKey;
+    } catch {
+      return false;
+    }
+  })) {
+    return false;
+  }
+  array.push(value);
+  return true;
+}
+
+function updateThreadProjectGlobalState(globalState, ids, targetPath) {
+  if (!globalState) return false;
+  const atom = persistedAtomState(globalState);
+  const cleanIds = Array.from(new Set((ids || []).map(String).filter(Boolean)));
+  const projectPath = normalizeProjectPath(targetPath);
+  let changed = false;
+  const containers = atom ? [globalState, atom] : [globalState];
+
+  for (const container of containers) {
+    if (!container || typeof container !== "object") continue;
+    if (!container["thread-workspace-root-hints"] || typeof container["thread-workspace-root-hints"] !== "object") {
+      container["thread-workspace-root-hints"] = {};
+      changed = true;
+    }
+
+    const hints = container["thread-workspace-root-hints"];
+    for (const id of cleanIds) {
+      if (hints[id] !== projectPath) {
+        hints[id] = projectPath;
+        changed = true;
+      }
+    }
+
+    changed = removeFromArray(container["projectless-thread-ids"], cleanIds) || changed;
+    changed = addUniqueProjectPath(container["electron-saved-workspace-roots"], projectPath) || changed;
+    changed = addUniqueProjectPath(container["project-order"], projectPath) || changed;
+  }
+
+  return changed;
 }
 
 function copyObjectEntry(container, sourceId, targetId) {
@@ -1232,6 +1323,71 @@ async function moveThreads(ids, targetProvider) {
   `);
 
   return { changed: threads.length, backupDir };
+}
+
+async function moveThreadsToProject(options = {}) {
+  const threadId = String(options.id || "").trim();
+  if (!threadId) throw new Error("Conversation ID is required.");
+  const targetPath = normalizeExistingProjectDirectory(options.targetPath);
+
+  const rows = await getAllThreadRows();
+  const source = rows.find((row) => row.id === threadId);
+  if (!source) throw new Error("Conversation was not found.");
+  if (!source.cwd) throw new Error("This conversation has no recorded project directory.");
+
+  const oldPath = normalizeProjectPath(source.cwd);
+  if (projectPathCompareKey(oldPath) === projectPathCompareKey(targetPath)) {
+    throw new Error("The selected project directory is the same as the current project directory.");
+  }
+
+  const oldKey = projectPathCompareKey(oldPath);
+  const selected = options.moveAll
+    ? rows.filter((row) => {
+      try {
+        return row.cwd && projectPathCompareKey(row.cwd) === oldKey;
+      } catch {
+        return false;
+      }
+    })
+    : [source];
+  if (!selected.length) throw new Error("No matching conversations were found.");
+
+  const backupDir = await createBackup("move-project", {
+    rolloutPaths: selected.map((thread) => thread.rollout_path),
+    includeGlobalState: true,
+  });
+
+  for (const thread of selected) {
+    if (thread.rollout_path && fs.existsSync(thread.rollout_path)) {
+      updateSessionMeta(thread.rollout_path, (meta) => {
+        meta.payload.cwd = targetPath;
+      });
+    }
+  }
+
+  const updates = selected.map((thread) => (
+    `UPDATE threads SET cwd = ${sqlQuote(formatCwdForDatabase(targetPath, thread.cwd))} WHERE id = ${sqlQuote(thread.id)};`
+  )).join("\n");
+  await runSql(`
+    PRAGMA busy_timeout = 5000;
+    BEGIN IMMEDIATE;
+    ${updates}
+    COMMIT;
+  `);
+
+  const globalState = readGlobalState();
+  const globalStateChanged = updateThreadProjectGlobalState(globalState, selected.map((thread) => thread.id), targetPath);
+  if (globalStateChanged) writeGlobalState(globalState);
+
+  return {
+    changed: selected.length,
+    movedIds: selected.map((thread) => thread.id),
+    oldPath,
+    targetPath,
+    moveAll: Boolean(options.moveAll),
+    globalStateChanged,
+    backupDir,
+  };
 }
 
 async function deleteThreads(ids, backupLabel = "delete") {
@@ -2478,6 +2634,107 @@ function cleanupProviderManagerBackups() {
   };
 }
 
+async function selectDirectoryWithPowerShell(initialPath) {
+  const script = `
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$owner = New-Object System.Windows.Forms.Form
+$owner.Text = "ProviderManager - 选择新项目目录"
+$owner.ShowInTaskbar = $true
+$owner.TopMost = $true
+$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+$owner.MaximizeBox = $false
+$owner.MinimizeBox = $false
+$owner.Width = 420
+$owner.Height = 110
+$label = New-Object System.Windows.Forms.Label
+$label.Dock = [System.Windows.Forms.DockStyle]::Fill
+$label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+$label.Text = "请在弹出的窗口中选择新项目目录"
+$owner.Controls.Add($label)
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = "选择新项目目录"
+$initial = $env:CPM_INITIAL_DIR
+if ($initial -and [System.IO.Directory]::Exists($initial)) {
+  $dialog.SelectedPath = $initial
+}
+try {
+  $owner.Show()
+  $owner.Activate()
+  $owner.BringToFront()
+  $result = $dialog.ShowDialog($owner)
+  if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+    $encodedPath = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($dialog.SelectedPath))
+    Write-Output "__CPM_DIR__$encodedPath"
+  }
+} finally {
+  $owner.Close()
+  $owner.Dispose()
+}
+`;
+  const result = await execFileAsync("powershell.exe", [
+    "-NoProfile",
+    "-STA",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    script,
+  ], {
+    env: { ...process.env, CPM_INITIAL_DIR: initialPath || "" },
+    windowsHide: true,
+  });
+  const line = result.stdout.split(/\r?\n/).find((item) => item.startsWith("__CPM_DIR__"));
+  if (!line) return "";
+  return Buffer.from(line.slice("__CPM_DIR__".length), "base64").toString("utf8");
+}
+
+async function selectDirectoryWithOsascript(initialPath) {
+  const escaped = JSON.stringify(initialPath || os.homedir());
+  const script = initialPath
+    ? `POSIX path of (choose folder with prompt "选择新项目目录" default location POSIX file ${escaped})`
+    : 'POSIX path of (choose folder with prompt "选择新项目目录")';
+  try {
+    const result = await execFileAsync("osascript", ["-e", script], { windowsHide: true });
+    return result.stdout.trim();
+  } catch (error) {
+    if (/cancel/i.test(String(error.stderr || error.message || ""))) return "";
+    throw error;
+  }
+}
+
+async function selectDirectoryWithLinuxDialog(initialPath) {
+  const candidates = [
+    { command: "zenity", args: ["--file-selection", "--directory", "--title=选择新项目目录"] },
+    { command: "kdialog", args: ["--getexistingdirectory", initialPath || os.homedir()] },
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      const result = await execFileAsync(candidate.command, candidate.args, { windowsHide: true });
+      return result.stdout.trim();
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.errno === "ENOENT")) continue;
+      if (!String(error.stdout || "").trim()) return "";
+      throw error;
+    }
+  }
+
+  throw new Error("No directory picker is available. Install zenity or kdialog, then try again.");
+}
+
+async function selectProjectDirectory(initialPath) {
+  const initial = initialPath ? stripWindowsExtendedPathPrefix(initialPath) : "";
+  let selected = "";
+  if (process.platform === "win32") selected = await selectDirectoryWithPowerShell(initial);
+  else if (process.platform === "darwin") selected = await selectDirectoryWithOsascript(initial);
+  else selected = await selectDirectoryWithLinuxDialog(initial);
+
+  if (!selected) return { canceled: true, path: "" };
+  return { canceled: false, path: normalizeExistingProjectDirectory(selected) };
+}
+
 function contentTypeFor(filePath) {
   if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
   if (filePath.endsWith(".css")) return "text/css; charset=utf-8";
@@ -2576,8 +2833,16 @@ async function routeApi(req, res, url) {
       sawHeartbeat = true;
       lastHeartbeatAt = Date.now();
       result = { alive: true };
+    } else if (pathname === "/api/path/select-directory") {
+      result = await selectProjectDirectory(body.initialPath || "");
     } else if (pathname === "/api/thread/move") {
       result = await moveThreads(body.ids || [], body.provider);
+    } else if (pathname === "/api/thread/project-move") {
+      result = await moveThreadsToProject({
+        id: body.id,
+        targetPath: body.targetPath,
+        moveAll: Boolean(body.moveAll),
+      });
     } else if (pathname === "/api/thread/delete") {
       result = await deleteThreads(body.ids || []);
     } else if (pathname === "/api/thread/sync") {
@@ -2759,6 +3024,7 @@ module.exports = {
   startServer,
   readState,
   moveThreads,
+  moveThreadsToProject,
   deleteThreads,
   syncThreads,
   syncAllThreads,
@@ -2773,5 +3039,6 @@ module.exports = {
   switchClaudeProvider,
   deleteClaudeProvider,
   deleteClaudeSessions,
+  selectProjectDirectory,
   cleanupProviderManagerBackups,
 };

@@ -75,6 +75,7 @@ const elements = {
   confirmTitle: document.getElementById("confirmTitle"),
   confirmText: document.getElementById("confirmText"),
   cancelConfirm: document.getElementById("cancelConfirm"),
+  confirmAltAction: document.getElementById("confirmAltAction"),
   confirmAction: document.getElementById("confirmAction"),
   threadDialog: document.getElementById("threadDialog"),
   threadDialogTitle: document.getElementById("threadDialogTitle"),
@@ -138,28 +139,35 @@ function authActionMessage(result) {
 }
 
 function confirmDialog(options) {
-  const { title = "确认操作", message, confirmText = "确认", danger = true } = options || {};
+  const { title = "确认操作", message, confirmText = "确认", altText = "", danger = true } = options || {};
   elements.confirmTitle.textContent = title;
   elements.confirmText.textContent = message || "";
   elements.confirmAction.textContent = confirmText;
   elements.confirmAction.className = danger ? "danger-btn" : "primary-btn";
+  elements.confirmAltAction.textContent = altText;
+  elements.confirmAltAction.hidden = !altText;
+  elements.confirmAltAction.className = "ghost-btn";
   return new Promise((resolve) => {
     const cleanup = (value) => {
       elements.cancelConfirm.removeEventListener("click", onCancel);
+      elements.confirmAltAction.removeEventListener("click", onAlt);
       elements.confirmAction.removeEventListener("click", onConfirm);
       elements.confirmDialog.removeEventListener("cancel", onDialogCancel);
       elements.confirmDialog.removeEventListener("close", onDialogClose);
       if (elements.confirmDialog.open) elements.confirmDialog.close();
+      elements.confirmAltAction.hidden = true;
       resolve(value);
     };
     const onCancel = () => cleanup(false);
-    const onConfirm = () => cleanup(true);
+    const onAlt = () => cleanup("alt");
+    const onConfirm = () => cleanup(altText ? "confirm" : true);
     const onDialogCancel = (event) => {
       event.preventDefault();
       cleanup(false);
     };
     const onDialogClose = () => cleanup(false);
     elements.cancelConfirm.addEventListener("click", onCancel);
+    elements.confirmAltAction.addEventListener("click", onAlt);
     elements.confirmAction.addEventListener("click", onConfirm);
     elements.confirmDialog.addEventListener("cancel", onDialogCancel);
     elements.confirmDialog.addEventListener("close", onDialogClose);
@@ -630,6 +638,13 @@ function renderRows() {
       event.stopPropagation();
       deleteSingleRecord(record, activeApp);
     });
+    const rowProjectMoveBtn = row.querySelector(".row-project-move-btn");
+    if (rowProjectMoveBtn) {
+      rowProjectMoveBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        moveRecordToProject(record);
+      });
+    }
 
     elements.threadRows.appendChild(row);
   }
@@ -658,6 +673,7 @@ function codexRowHtml(thread) {
     </div>
     <div class="record-actions">
       <button class="row-delete-btn" type="button" title="删除该对话">删除</button>
+      <button class="row-project-move-btn" type="button" title="移动到新项目目录">移动</button>
     </div>
   `;
 }
@@ -792,6 +808,49 @@ async function deleteSingleRecord(record, appName) {
     () => api("/api/claude/session/delete", { body: { ids: [record.id] } }),
     "Claude 会话删除完成"
   );
+}
+
+async function chooseProjectDirectory(initialPath) {
+  const result = await api("/api/path/select-directory", { body: { initialPath: displayPath(initialPath) } });
+  if (!result || result.canceled) return "";
+  return result.path || "";
+}
+
+async function moveRecordToProject(record) {
+  if (activeApp !== "codex") return;
+  if (!record.cwd) {
+    showToast("该对话没有记录旧项目目录，不能移动。");
+    return;
+  }
+
+  try {
+    const targetPath = await chooseProjectDirectory(record.cwd);
+    if (!targetPath) return;
+
+    const oldPath = displayPath(record.cwd);
+    const sameProjectCount = projectMatchCount(record);
+    const choice = await confirmDialog({
+      title: "移动到新项目",
+      message: `将对话「${record.title}」从 ${oldPath} 移动到 ${targetPath}？点击“全部移动”会同时移动旧项目目录一致的 ${sameProjectCount} 个对话。`,
+      confirmText: "移动",
+      altText: "全部移动",
+      danger: false,
+    });
+    if (!choice) return;
+
+    await runAction(
+      () => api("/api/thread/project-move", {
+        body: {
+          id: record.id,
+          targetPath,
+          moveAll: choice === "alt",
+        },
+      }),
+      choice === "alt" ? "全部移动完成" : "移动完成"
+    );
+  } catch (error) {
+    showToast(error.message);
+  }
 }
 
 async function cleanupBackups() {
@@ -1165,7 +1224,20 @@ function escapeAttr(value) {
 
 function displayPath(value) {
   const text = String(value || "");
+  if (text.startsWith("\\\\?\\UNC\\")) return `\\\\${text.slice("\\\\?\\UNC\\".length)}`;
   return text.replace(/^\\\\\?\\/, "");
+}
+
+function projectPathKey(value) {
+  const text = displayPath(value).trim().replace(/[\\/]+$/, "");
+  return text.toLowerCase();
+}
+
+function projectMatchCount(record) {
+  if (!codexState || !record || !record.cwd) return 0;
+  const key = projectPathKey(record.cwd);
+  if (!key) return 0;
+  return codexState.threads.filter((thread) => projectPathKey(thread.cwd) === key).length;
 }
 
 elements.modeTabs.forEach((tab) => {
