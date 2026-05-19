@@ -60,6 +60,36 @@ function patchWindowsSubsystem(executablePath) {
   }
 }
 
+function findWindowsSignatureTool() {
+  if (process.platform !== "win32") return null;
+
+  const direct = firstCommandPath("signtool.exe");
+  if (direct) return direct;
+
+  const kitsRoot = path.join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "Windows Kits", "10", "bin");
+  try {
+    return fs.readdirSync(kitsRoot)
+      .map((version) => path.join(kitsRoot, version, "x64", "signtool.exe"))
+      .filter((candidate) => fs.existsSync(candidate))
+      .sort()
+      .pop() || null;
+  } catch {
+    return null;
+  }
+}
+
+function removeWindowsSignature(executablePath) {
+  if (process.platform !== "win32") return;
+
+  const signtool = findWindowsSignatureTool();
+  if (!signtool) {
+    console.warn("signtool.exe was not found; continuing without removing the Windows signature.");
+    return;
+  }
+
+  run(signtool, ["remove", "/s", executablePath]);
+}
+
 function removeDarwinSignature(executablePath) {
   if (process.platform !== "darwin") return;
   run("codesign", ["--remove-signature", executablePath]);
@@ -144,6 +174,7 @@ fs.writeFileSync(seaConfigPath, `${JSON.stringify(seaConfig, null, 2)}\n`, "utf8
 run(process.execPath, ["--experimental-sea-config", seaConfigPath]);
 
 fs.copyFileSync(process.execPath, exePath);
+removeWindowsSignature(exePath);
 removeDarwinSignature(exePath);
 
 const postjectArgs = [

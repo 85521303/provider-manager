@@ -100,8 +100,13 @@ jobs:
       - name: Generate app icons
         run: npm run tauri:icons
 
+      - name: Prepare desktop sidecar
+        run: npm run tauri:prepare
+
       - name: Build desktop bundle
-        run: node scripts/tauri-with-dist-target.js build --bundles "${{ matrix.bundles }}"
+        run: npx tauri build --bundles "${{ matrix.bundles }}"
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/dist/tauri-target
 
       - name: Upload ${{ matrix.name }} artifacts
         uses: actions/upload-artifact@v4
